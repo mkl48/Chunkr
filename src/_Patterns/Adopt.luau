@@ -163,15 +163,28 @@ function Adopt.part(world: any, part: BasePart): Body.Body?
 	local cfg = world.config.adopt
 
 	local size = part.Size
-	local voxelSize = tonumber(part:GetAttribute("ChunkrVoxelSize")) or cfg.voxelSize
 	local studsVolume = size.X * size.Y * size.Z
-	local estimate = studsVolume / (voxelSize ^ 3)
-	if estimate > cfg.maxVoxels then
-		-- Huge parts coarsen to stay affordable.
+
+	-- Voxel size, by priority: explicit per-part attribute > relative
+	-- sizing (per-part ChunkrResolution > config) > fixed config size.
+	local explicit = tonumber(part:GetAttribute("ChunkrVoxelSize"))
+	local voxelSize
+	if explicit then
+		voxelSize = explicit
+	elseif cfg.sizing == "relative" then
+		local resolution = tonumber(part:GetAttribute("ChunkrResolution")) or cfg.relativeResolution
+		local maxAxis = math.max(size.X, size.Y, size.Z)
+		voxelSize = math.max(maxAxis / resolution, cfg.minimumVoxelSize)
+	else
+		voxelSize = cfg.voxelSize
+		if studsVolume / (voxelSize ^ 3) < cfg.minVoxels then
+			-- Fixed mode: small parts refine so they break well.
+			voxelSize = math.max((studsVolume / cfg.minVoxels) ^ (1 / 3), cfg.minAutoVoxelSize)
+		end
+	end
+	-- Budget guard (all modes): huge parts coarsen to stay affordable.
+	if studsVolume / (voxelSize ^ 3) > cfg.maxVoxels then
 		voxelSize = math.min((studsVolume / cfg.maxVoxels) ^ (1 / 3), cfg.maxAutoVoxelSize)
-	elseif estimate < cfg.minVoxels and not part:GetAttribute("ChunkrVoxelSize") then
-		-- Small parts refine so they have enough voxels to break well.
-		voxelSize = math.max((studsVolume / cfg.minVoxels) ^ (1 / 3), cfg.minAutoVoxelSize)
 	end
 
 	local sx = math.max(1, math.round(size.X / voxelSize))

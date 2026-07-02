@@ -66,14 +66,23 @@ local Config = {
 	-- Per-part overrides: ChunkrMaterial (name), ChunkrVoxelSize (studs).
 	adopt = {
 		enabled = true,
-		voxelSize = 1, -- studs per voxel for adopted parts
-		-- Big parts auto-coarsen their voxel size to stay under maxVoxels
-		-- (a 512-stud baseplate becomes ~4-stud voxels instead of a million).
+		-- How adopted parts pick their voxel size:
+		--   "fixed"    - voxelSize studs for everything (with the auto
+		--                refine/coarsen guards below)
+		--   "relative" - proportional to the part: ~relativeResolution voxels
+		--                along its longest axis, so every part costs about
+		--                the same regardless of size. Clamped to
+		--                minimumVoxelSize so small props don't go microscopic.
+		sizing = "fixed",
+		voxelSize = 1, -- fixed mode: studs per voxel
+		relativeResolution = 14, -- relative mode: voxels along the longest axis
+		minimumVoxelSize = 0.25, -- relative mode floor (studs per voxel)
+		-- Guards (both modes): big parts auto-coarsen to stay under
+		-- maxVoxels (a 512-stud baseplate becomes coarse voxels, not a
+		-- million); in fixed mode small parts auto-refine toward minVoxels
+		-- so they have enough voxels to break interestingly.
 		maxVoxels = 150000,
 		maxAutoVoxelSize = 8,
-		-- ...and SMALL parts auto-refine so they have enough voxels to break
-		-- interestingly (a 4-stud ball at 1 stud/voxel is ~33 voxels - two
-		-- blobs; refined to ~0.4 it's ~500 and shatters properly).
 		minVoxels = 500,
 		minAutoVoxelSize = 0.25,
 		-- Destructible-map healing: destroyed originals return after this
