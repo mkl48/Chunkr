@@ -8541,6 +8541,7 @@ local Body = require(script.Parent.Parent._Classes.Body)
 local Volume = require(script.Parent.Parent._Classes.Volume)
 local Materials = require(script.Parent.Materials)
 local Fracture = require(script.Parent.Fracture)
+local Boxer = require(script.Parent.Boxer)
 local Bin = require(script.Parent.Parent._Utility.Bin)
 
 local Adopt = {}
@@ -8630,12 +8631,46 @@ function Adopt.eligible(part: Instance): boolean
 	if part:GetAttribute("ChunkrIgnore") then
 		return false
 	end
+	-- Non-colliding parts are decoration/FX, not structure.
+	if not part.CanCollide then
+		return false
+	end
 	-- Never adopt characters/NPCs.
 	local model = part:FindFirstAncestorOfClass("Model")
 	if model and model:FindFirstChildOfClass("Humanoid") then
 		return false
 	end
 	return true
+end
+
+-- Shape-aware fill predicate: voxel centre (px,py,pz) in part-local studs,
+-- `half` = part.Size/2. Balls voxelize round, cylinders round-along-X,
+-- wedges sloped; everything else fills its box.
+local function occupied(part: BasePart, px: number, py: number, pz: number, half: Vector3): boolean
+	-- Rounded dims can overhang the true size by half a voxel; trim to size.
+	if math.abs(px) > half.X or math.abs(py) > half.Y or math.abs(pz) > half.Z then
+		return false
+	end
+	if part:IsA("Part") then
+		local shape = part.Shape
+		if shape == Enum.PartType.Ball then
+			local radius = math.min(half.X, half.Y, half.Z)
+			return px * px + py * py + pz * pz <= radius * radius
+		elseif shape == Enum.PartType.Cylinder then
+			-- Roblox cylinders lie along X.
+			local radius = math.min(half.Y, half.Z)
+			return py * py + pz * pz <= radius * radius
+		elseif shape == Enum.PartType.Wedge then
+			return (py + half.Y) / (half.Y * 2) <= (pz + half.Z) / (half.Z * 2)
+		elseif shape == Enum.PartType.CornerWedge then
+			local yFrac = (py + half.Y) / (half.Y * 2)
+			return yFrac <= (px + half.X) / (half.X * 2) and yFrac <= (half.Z - pz) / (half.Z * 2)
+		end
+		return true -- Block
+	elseif part:IsA("WedgePart") then
+		return (py + half.Y) / (half.Y * 2) <= (pz + half.Z) / (half.Z * 2)
+	end
+	return true -- MeshPart/unions/etc: bounding box (v1)
 end
 
 -- Voxelizes one part into a Body (solid box at inferred resolution),
@@ -8664,20 +8699,59 @@ function Adopt.part(world: any, part: BasePart): Body.Body?
 
 	local material = resolveMaterial(part)
 	local volume = Volume.new(sx, sy, sz)
-	volume:FillBox(0, 0, 0, sx - 1, sy - 1, sz - 1, material.id)
+	local half = size / 2
+	local originOffset = Vector3.new(sx, sy, sz) * voxelSize / 2
+	for y = 0, sy - 1 do
+		for z = 0, sz - 1 do
+			for x = 0, sx - 1 do
+				local px = (x + 0.5) * voxelSize - originOffset.X
+				local py = (y + 0.5) * voxelSize - originOffset.Y
+				local pz = (z + 0.5) * voxelSize - originOffset.Z
+				if occupied(part, px, py, pz, half) then
+					volume:Set(x, y, z, material.id)
+				end
+			end
+		end
+	end
+	if volume:IsEmpty() then
+		return nil -- degenerate (part far thinner than a voxel)
+	end
 	volume:ClearDirty()
 
 	local body = Body.fromVolume(volume, {
 		voxelSize = voxelSize,
-		cframe = part.CFrame * CFrame.new(-Vector3.new(sx, sy, sz) * voxelSize / 2),
+		cframe = part.CFrame * CFrame.new(-originOffset),
 		anchored = part.Anchored,
 	})
 	if not part.Anchored then
 		body._pendingVelocity = part.AssemblyLinearVelocity
 		body._pendingAngularVelocity = part.AssemblyAngularVelocity
 	end
-	body.needsRemesh = true
 	world:Add(body)
+
+	-- Build the Parts SYNCHRONOUSLY so there's no frame where the object
+	-- doesn't exist (the original dies this call) - and so blast kicks and
+	-- immediate carves land on a real assembly.
+	body:ApplyBoxes(Boxer.decompose(volume.voxels, sx, sy, sz))
+
+	-- Respawn: the original part comes back after a while (destructible-map
+	-- healing). Per-part ChunkrRespawn attribute (seconds) overrides config;
+	-- 0/absent = never. The voxel body is removed when the original returns;
+	-- loose fragments stay and despawn as normal debris.
+	local respawnSeconds = tonumber(part:GetAttribute("ChunkrRespawn")) or cfg.respawnSeconds
+	if respawnSeconds and respawnSeconds > 0 then
+		local clone = part:Clone()
+		local parent = part.Parent
+		task.delay(respawnSeconds, function()
+			if not body.destroyed and world.bodies[body.id] == body then
+				world:Remove(body)
+			end
+			if parent and parent.Parent then
+				clone.Parent = parent
+			end
+		end)
+	end
+
 	part:Destroy()
 	return body
 end
@@ -10211,6 +10285,10 @@ local Config = {
 		-- (a 512-stud baseplate becomes ~4-stud voxels instead of a million).
 		maxVoxels = 150000,
 		maxAutoVoxelSize = 8,
+		-- Destructible-map healing: destroyed originals return after this
+		-- many seconds (their voxel body is removed; loose fragments remain
+		-- as debris). 0 = never respawn. Per-part ChunkrRespawn overrides.
+		respawnSeconds = 0,
 	},
 
 	-- Networking

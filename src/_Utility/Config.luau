@@ -71,6 +71,10 @@ local Config = {
 		-- (a 512-stud baseplate becomes ~4-stud voxels instead of a million).
 		maxVoxels = 150000,
 		maxAutoVoxelSize = 8,
+		-- Destructible-map healing: destroyed originals return after this
+		-- many seconds (their voxel body is removed; loose fragments remain
+		-- as debris). 0 = never respawn. Per-part ChunkrRespawn overrides.
+		respawnSeconds = 0,
 	},
 
 	-- Networking

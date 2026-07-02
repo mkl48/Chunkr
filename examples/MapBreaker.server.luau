@@ -65,7 +65,8 @@ map.Parent = workspace
 
 -- ---------------------------------------------------------------- engine
 
-local world = Chunkr.new()
+-- The map heals: destroyed originals respawn 25s after adoption.
+local world = Chunkr.new({ adopt = { respawnSeconds = 25 } })
 world:Start()
 
 Chunkr.Events.OnFracture:Connect(function(event, _pattern)
