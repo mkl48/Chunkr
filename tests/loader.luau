@@ -18,6 +18,7 @@ local FILES = {
 	["_Classes.FracturePattern"] = "src/_Classes/FracturePattern.luau",
 	["_Patterns.Damage"] = "src/_Patterns/Damage.luau",
 	["_Patterns.Fracture"] = "src/_Patterns/Fracture/init.luau",
+	["_Patterns.Fracture.Regions"] = "src/_Patterns/Fracture/Regions.luau",
 	["_Patterns.Fracture.Planes"] = "src/_Patterns/Fracture/Planes.luau",
 	["_Patterns.Fracture.Worley"] = "src/_Patterns/Fracture/Worley.luau",
 	["_Patterns.Fracture.Radial"] = "src/_Patterns/Fracture/Radial.luau",

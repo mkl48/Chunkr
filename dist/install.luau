@@ -8763,18 +8763,20 @@ return Fracture
 mod("Planes", _13, [[
 --!native
 -- Stock generator: slices space with random planes through the pattern
--- centre. Produces wedge-shaped fragments - good for wood splits and rough
--- masonry. `grain` stretches the distance metric so cracks run preferentially
--- along one axis (wood splinters along Y with grain = {1, 0.25, 1}).
+-- centre. Each voxel's region is the bitmask of which side of each plane it
+-- lies on; the 1-voxel wall between differing regions is deleted (see
+-- Regions), producing wedge fragments joined by nothing. `grain` stretches
+-- plane normals so cracks run preferentially along one axis (wood splinters
+-- along Y with grain = {1, 0.25, 1}).
 
 local Grid = require(script.Parent.Parent.Parent._Utility.Grid)
 local FracturePattern = require(script.Parent.Parent.Parent._Classes.FracturePattern)
+local Regions = require(script.Parent.Regions)
 
 local Planes = {}
 
 export type Options = {
 	planeCount: number?,
-	thickness: number?,
 	seed: number?,
 	-- Per-axis multipliers on plane normals; small value = cracks avoid
 	-- cutting across that axis (i.e. they run along it).
@@ -8784,8 +8786,7 @@ export type Options = {
 function Planes.generate(size: number, options: Options?): FracturePattern.FracturePattern
 	local opts: Options = options or {}
 	local rand = Grid.rng(opts.seed or 1)
-	local planeCount = opts.planeCount or 4
-	local thickness = opts.thickness or 0.55
+	local planeCount = math.min(opts.planeCount or 4, 16)
 	local grain = opts.grain or { 1, 1, 1 }
 	local c = (size - 1) / 2
 
@@ -8807,34 +8808,40 @@ function Planes.generate(size: number, options: Options?): FracturePattern.Fract
 		table.insert(planes, { nx = nx, ny = ny, nz = nz, d = nx * px + ny * py + nz * pz })
 	end
 
-	return FracturePattern.fromFunction(size, size, size, function(x, y, z)
-		for _, p in planes do
-			if math.abs(p.nx * x + p.ny * y + p.nz * z - p.d) <= thickness then
-				return true
+	local flags = Regions.flags(size, size, size, function(x, y, z)
+		local mask = 0
+		for index, p in planes do
+			if p.nx * x + p.ny * y + p.nz * z > p.d then
+				mask += bit32.lshift(1, index - 1)
 			end
 		end
-		return false
+		return mask
 	end)
+	return FracturePattern.new(size, size, size, flags)
 end
 
 return Planes
 ]])
 mod("Radial", _13, [[
 --!native
--- Stock generator: radial spokes + concentric rings around the impact axis -
--- the glass spiderweb. Canonical facing is Top (impact travelling -Y), so the
--- web spreads in the XZ plane and punches through the full Y depth, which is
--- right for panes and thin shells.
+-- Stock generator: the glass spiderweb. Inside the web disc, a voxel's
+-- region is its (spoke sector, ring band) pair - sector boundaries are the
+-- radial cracks, band boundaries the concentric rings - and the 1-voxel wall
+-- between differing regions is deleted (see Regions). Outside the disc is
+-- region -1: untouched, no crack against it.
+--
+-- Canonical facing is Top (impact travelling -Y): the web spreads in XZ and
+-- punches through the full Y depth, right for panes and thin shells.
 
 local Grid = require(script.Parent.Parent.Parent._Utility.Grid)
 local FracturePattern = require(script.Parent.Parent.Parent._Classes.FracturePattern)
+local Regions = require(script.Parent.Regions)
 
 local Radial = {}
 
 export type Options = {
 	spokes: number?,
 	rings: number?,
-	crackWidth: number?,
 	seed: number?,
 }
 
@@ -8843,49 +8850,119 @@ function Radial.generate(size: number, options: Options?): FracturePattern.Fract
 	local rand = Grid.rng(opts.seed or 1)
 	local spokeCount = opts.spokes or 7
 	local ringCount = opts.rings or 2
-	-- Kept thin on purpose: cracks should sever shards, not erase the pane.
-	local crackWidth = opts.crackWidth or 0.45
 	local c = (size - 1) / 2
 	local maxR = size / 2
 
-	-- Jittered spoke angles so the web isn't perfectly regular.
+	-- Jittered, sorted spoke angles in [0, 2π) so the web isn't regular.
 	local spokes = {}
 	for i = 1, spokeCount do
 		local base = (i / spokeCount) * math.pi * 2
-		table.insert(spokes, base + (rand() - 0.5) * (math.pi / spokeCount))
+		table.insert(spokes, (base + (rand() - 0.5) * (math.pi / spokeCount)) % (math.pi * 2))
 	end
-	-- Ring radii, spaced outward with jitter.
+	table.sort(spokes)
+	-- Ring radii, spaced outward with jitter, sorted.
 	local rings = {}
 	for i = 1, ringCount do
 		table.insert(rings, maxR * (i / (ringCount + 1)) * (0.85 + rand() * 0.3))
 	end
+	table.sort(rings)
 
-	return FracturePattern.fromFunction(size, size, size, function(x, y, z)
+	local flags = Regions.flags(size, size, size, function(x, y, z)
 		local dx, dz = x - c, z - c
 		local r = math.sqrt(dx * dx + dz * dz)
 		if r > maxR then
-			return false
+			return -1 -- outside the web: keep, and no crack against it
 		end
-		if r > 1 then
-			-- Distance from the nearest spoke plane is r·sin(Δθ).
-			local theta = math.atan2(dz, dx)
-			for _, spoke in spokes do
-				local diff = math.abs(math.atan2(math.sin(theta - spoke), math.cos(theta - spoke)))
-				if r * math.sin(math.min(diff, math.pi / 2)) <= crackWidth then
-					return true
-				end
+		local theta = math.atan2(dz, dx) % (math.pi * 2)
+		local sector = 0
+		for _, spoke in spokes do
+			if theta >= spoke then
+				sector += 1
 			end
 		end
+		-- theta below the first spoke wraps into the last sector.
+		sector %= spokeCount
+		local band = 0
 		for _, ring in rings do
-			if math.abs(r - ring) <= crackWidth then
-				return true
+			if r >= ring then
+				band += 1
 			end
 		end
-		return false
+		return sector * 32 + band
 	end)
+	return FracturePattern.new(size, size, size, flags)
 end
 
 return Radial
+]])
+mod("Regions", _13, [[
+--!native
+-- Shared cell-boundary crack builder for the stock generators.
+--
+-- Instead of deleting a distance band around cell boundaries (which must be
+-- ~2 voxels thick before it reliably severs, and then erases 30%+ of the
+-- material), each voxel is assigned a REGION id and exactly one voxel of
+-- wall is deleted between differing regions - only on the lower-id side.
+--
+-- Why one-sided deletion still guarantees separation: any 6-connected path
+-- from region A to region B must step directly from an A voxel to a B
+-- voxel; whichever of the pair has the smaller region id was deleted, so
+-- the step is impossible. Cracks are exactly 1 voxel thin, the true/false
+-- map keeps everything else, and Topology takes it from there.
+--
+-- region(x, y, z) returns an integer >= 0, or -1 for "outside the pattern"
+-- (no crack is drawn against outside).
+
+local Regions = {}
+
+function Regions.flags(sx: number, sy: number, sz: number, region: (number, number, number) -> number): buffer
+	local total = sx * sy * sz
+	local ids = table.create(total)
+	local i = 0
+	for y = 0, sy - 1 do
+		for z = 0, sz - 1 do
+			for x = 0, sx - 1 do
+				i += 1
+				ids[i] = region(x, y, z)
+			end
+		end
+	end
+
+	local flags = buffer.create(total)
+	local function idAt(x: number, y: number, z: number): number
+		if x < 0 or y < 0 or z < 0 or x >= sx or y >= sy or z >= sz then
+			return -1
+		end
+		return ids[1 + x + (z + y * sz) * sx]
+	end
+
+	i = 0
+	for y = 0, sy - 1 do
+		for z = 0, sz - 1 do
+			for x = 0, sx - 1 do
+				i += 1
+				local mine = ids[i]
+				if mine >= 0 then
+					local function boundary(nx: number, ny: number, nz: number): boolean
+						local theirs = idAt(nx, ny, nz)
+						return theirs >= 0 and theirs > mine
+					end
+					if
+						boundary(x - 1, y, z) or boundary(x + 1, y, z)
+						or boundary(x, y - 1, z) or boundary(x, y + 1, z)
+						or boundary(x, y, z - 1) or boundary(x, y, z + 1)
+					then
+						-- Grid layout must match Grid.offset (x, then z, then y).
+						buffer.writeu8(flags, x + z * sx + y * sx * sz, 1)
+					end
+				end
+			end
+		end
+	end
+	return flags
+end
+
+return Regions
 ]])
 mod("Stock", _13, [[
 -- Prebuilt fracture tables for common material archetypes. Each builder takes
@@ -8935,20 +9012,19 @@ return Stock
 ]])
 mod("Worley", _13, [[
 --!native
--- Stock generator: Worley/cellular cracks. Scatters seed points and deletes
--- voxels lying on the boundary between the two nearest cells - natural chunky
--- fragments, the classic rock/concrete look ("whirly noise" per Douglas).
+-- Stock generator: Worley/cellular shatter. Scatters seed points, assigns
+-- every voxel to its nearest seed, and deletes the 1-voxel-thin wall between
+-- differing cells (see Regions) - natural chunky fragments, the classic
+-- rock/concrete look, without erasing the material between them.
 
 local Grid = require(script.Parent.Parent.Parent._Utility.Grid)
 local FracturePattern = require(script.Parent.Parent.Parent._Classes.FracturePattern)
+local Regions = require(script.Parent.Regions)
 
 local Worley = {}
 
 export type Options = {
 	cellCount: number?,
-	-- Boundary width: how close the two nearest-seed distances must be for a
-	-- voxel to count as crack. Bigger = thicker cracks, chunkier loss.
-	crackWidth: number?,
 	seed: number?,
 }
 
@@ -8956,26 +9032,25 @@ function Worley.generate(size: number, options: Options?): FracturePattern.Fract
 	local opts: Options = options or {}
 	local rand = Grid.rng(opts.seed or 1)
 	local cellCount = opts.cellCount or 8
-	local crackWidth = opts.crackWidth or 1.1
 
 	local seeds = {}
 	for _ = 1, cellCount do
 		table.insert(seeds, { x = rand() * size, y = rand() * size, z = rand() * size })
 	end
 
-	return FracturePattern.fromFunction(size, size, size, function(x, y, z)
-		local d1, d2 = math.huge, math.huge
-		for _, s in seeds do
-			local dx, dy, dz = x - s.x, y - s.y, z - s.z
-			local d = math.sqrt(dx * dx + dy * dy + dz * dz)
-			if d < d1 then
-				d1, d2 = d, d1
-			elseif d < d2 then
-				d2 = d
+	local flags = Regions.flags(size, size, size, function(x, y, z)
+		local best, bestD = 0, math.huge
+		for index, s in seeds do
+			local dx, dy, dz = x + 0.5 - s.x, y + 0.5 - s.y, z + 0.5 - s.z
+			local d = dx * dx + dy * dy + dz * dz
+			if d < bestD then
+				bestD = d
+				best = index
 			end
 		end
-		return d2 - d1 <= crackWidth
+		return best
 	end)
+	return FracturePattern.new(size, size, size, flags)
 end
 
 return Worley
@@ -10004,5 +10079,5 @@ end
 return Vox
 ]])
 
-print("[Chunkr] installed 63 modules (1 scripts) under ReplicatedStorage.Chunkr")
+print("[Chunkr] installed 64 modules (1 scripts) under ReplicatedStorage.Chunkr")
 return true
