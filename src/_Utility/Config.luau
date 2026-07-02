@@ -49,10 +49,15 @@ local Config = {
 		dents = true,
 		dentRatio = 0.35,
 		dentMaxRadius = 2.5,
+		-- One fracture pattern per body per window: multi-part contact bursts
+		-- and rapid re-hits don't compound several stamps into one landing.
+		fractureCooldown = 0.35,
 		-- Explosions crack the crater rim with the material's own fracture
 		-- patterns (chunks fall off) instead of leaving a clean sphere.
+		-- Skipped for small bodies (they'd get erased by the compounding).
 		rimFracture = true,
-		rimSamples = 3,
+		rimSamples = 2,
+		rimMinVoxels = 600,
 	},
 
 	-- Networking

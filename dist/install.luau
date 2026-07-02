@@ -1943,7 +1943,7 @@ function World.Explode(self: World, position: Vector3, radiusStuds: number, powe
 		if carved > 0 then
 			-- Fragments of the coming split scatter from the blast centre.
 			body._lastFracture = { position = position, impulse = power * 800, at = os.clock() }
-			if self.config.impact.rimFracture and body.carvable then
+			if self.config.impact.rimFracture and body.carvable and body.volume.solidCount >= self.config.impact.rimMinVoxels then
 				fractureRim(self, body, position, radiusStuds)
 			end
 		end
@@ -8969,6 +8969,12 @@ mod("Stock", _13, [[
 -- the material's toughness so impulse bands scale with it: a light tap above
 -- threshold uses the small pattern, a violent hit the big one.
 --
+-- Deletion budget: destruction COMPOUNDS - one object eats a fracture, then
+-- rim cracks, then a second impact, then stress - so every pattern here stays
+-- around or under ~15% of its volume deleted (1-voxel region walls, few big
+-- cells). Fragment size and count are content knobs: more cells = more,
+-- smaller chunks = more material lost per stamp.
+--
 -- Patterns are generated once at require/build time and shared - they're
 -- immutable, so every material of the same archetype can reuse them.
 
@@ -8979,32 +8985,31 @@ local Radial = require(script.Parent.Radial)
 
 local Stock = {}
 
--- Glass: full spiderweb at any fracture, wider web on hard hits. Cracks stay
--- thin so most of the pane survives as shards that then fall as bodies.
+-- Glass: spiderweb, wider on hard hits. ~15-16% per stamp.
 function Stock.glass(toughness: number): Types.FractureTable
 	return {
-		{ pattern = Radial.generate(15, { spokes = 5, rings = 1, seed = 11 }), minImpulse = toughness, weight = 1 },
-		{ pattern = Radial.generate(23, { spokes = 7, rings = 2, seed = 12 }), minImpulse = toughness * 2, weight = 1 },
-		{ pattern = Radial.generate(31, { spokes = 9, rings = 3, seed = 13 }), minImpulse = toughness * 4, weight = 1 },
+		{ pattern = Radial.generate(17, { spokes = 4, rings = 1, seed = 11 }), minImpulse = toughness, weight = 1 },
+		{ pattern = Radial.generate(23, { spokes = 5, rings = 1, seed = 12 }), minImpulse = toughness * 2, weight = 1 },
+		{ pattern = Radial.generate(31, { spokes = 6, rings = 2, seed = 13 }), minImpulse = toughness * 4, weight = 1 },
 	}
 end
 
--- Stone/concrete/brick: chunky Worley cells, alternates for variety.
+-- Stone/concrete/brick: few chunky Worley cells. ~10-13% per stamp.
 function Stock.stone(toughness: number): Types.FractureTable
 	return {
-		{ pattern = Worley.generate(11, { cellCount = 5, seed = 21 }), minImpulse = toughness, weight = 2 },
-		{ pattern = Worley.generate(11, { cellCount = 7, seed = 22 }), minImpulse = toughness, weight = 1 },
-		{ pattern = Worley.generate(19, { cellCount = 10, seed = 23 }), minImpulse = toughness * 3, weight = 2 },
-		{ pattern = Worley.generate(19, { cellCount = 14, seed = 24 }), minImpulse = toughness * 3, weight = 1 },
+		{ pattern = Worley.generate(13, { cellCount = 3, seed = 21 }), minImpulse = toughness, weight = 2 },
+		{ pattern = Worley.generate(13, { cellCount = 4, seed = 22 }), minImpulse = toughness, weight = 1 },
+		{ pattern = Worley.generate(21, { cellCount = 5, seed = 23 }), minImpulse = toughness * 3, weight = 2 },
+		{ pattern = Worley.generate(21, { cellCount = 6, seed = 24 }), minImpulse = toughness * 3, weight = 1 },
 	}
 end
 
--- Wood: plane splits with strong grain along Y (author walls with grain up).
+-- Wood: plane splits with strong grain along Y. ~15% per stamp.
 function Stock.wood(toughness: number): Types.FractureTable
 	local grain = { 1, 0.2, 1 }
 	return {
-		{ pattern = Planes.generate(11, { planeCount = 3, grain = grain, seed = 31 }), minImpulse = toughness, weight = 1 },
-		{ pattern = Planes.generate(17, { planeCount = 5, grain = grain, seed = 32 }), minImpulse = toughness * 2.5, weight = 1 },
+		{ pattern = Planes.generate(13, { planeCount = 2, grain = grain, seed = 31 }), minImpulse = toughness, weight = 1 },
+		{ pattern = Planes.generate(19, { planeCount = 3, grain = grain, seed = 32 }), minImpulse = toughness * 2.5, weight = 1 },
 	}
 end
 
@@ -9181,7 +9186,11 @@ function Impact.resolve(cfg: any, body: any, contact: Vector3, travelDir: Vector
 	end
 
 	local effective = impulse + Damage.get(body.damage, x, y, z)
-	if effective >= material.toughness and material.fractureTable then
+	-- Cooldown: a body that just fractured doesn't stack another pattern from
+	-- the same landing burst - destruction compounds fast enough as it is.
+	local lastFracture = body._lastFracture
+	local coolingDown = lastFracture ~= nil and os.clock() - lastFracture.at < cfg.impact.fractureCooldown
+	if effective >= material.toughness and material.fractureTable and not coolingDown then
 		Damage.clear(body.damage, x, y, z)
 		local event: Types.ImpactEvent = {
 			kind = "fracture",
@@ -9677,10 +9686,15 @@ local Config = {
 		dents = true,
 		dentRatio = 0.35,
 		dentMaxRadius = 2.5,
+		-- One fracture pattern per body per window: multi-part contact bursts
+		-- and rapid re-hits don't compound several stamps into one landing.
+		fractureCooldown = 0.35,
 		-- Explosions crack the crater rim with the material's own fracture
 		-- patterns (chunks fall off) instead of leaving a clean sphere.
+		-- Skipped for small bodies (they'd get erased by the compounding).
 		rimFracture = true,
-		rimSamples = 3,
+		rimSamples = 2,
+		rimMinVoxels = 600,
 	},
 
 	-- Networking

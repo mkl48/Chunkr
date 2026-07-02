@@ -123,7 +123,11 @@ function Impact.resolve(cfg: any, body: any, contact: Vector3, travelDir: Vector
 	end
 
 	local effective = impulse + Damage.get(body.damage, x, y, z)
-	if effective >= material.toughness and material.fractureTable then
+	-- Cooldown: a body that just fractured doesn't stack another pattern from
+	-- the same landing burst - destruction compounds fast enough as it is.
+	local lastFracture = body._lastFracture
+	local coolingDown = lastFracture ~= nil and os.clock() - lastFracture.at < cfg.impact.fractureCooldown
+	if effective >= material.toughness and material.fractureTable and not coolingDown then
 		Damage.clear(body.damage, x, y, z)
 		local event: Types.ImpactEvent = {
 			kind = "fracture",

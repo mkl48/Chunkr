@@ -120,7 +120,7 @@ function World.Explode(self: World, position: Vector3, radiusStuds: number, powe
 		if carved > 0 then
 			-- Fragments of the coming split scatter from the blast centre.
 			body._lastFracture = { position = position, impulse = power * 800, at = os.clock() }
-			if self.config.impact.rimFracture and body.carvable then
+			if self.config.impact.rimFracture and body.carvable and body.volume.solidCount >= self.config.impact.rimMinVoxels then
 				fractureRim(self, body, position, radiusStuds)
 			end
 		end
