@@ -22,6 +22,7 @@ local Debris = require(script.Parent.Parent._Patterns.Debris)
 local Topology = require(script.Parent.Parent._Patterns.Topology)
 local Grid = require(script.Parent.Parent._Utility.Grid)
 local Events = require(script.Parent.Parent._Utility.Events)
+local Bin = require(script.Parent.Parent._Utility.Bin)
 
 local Simulation = {}
 
@@ -134,7 +135,9 @@ local function applySplit(world: any, body: Body.Body, islands: { Topology.Islan
 			cframe = sourcePivot * CFrame.new(Vector3.new(island.ox, island.oy, island.oz) * body.voxelSize),
 			anchored = staysAnchored,
 			carvable = body.carvable and (staysAnchored or Debris.isCarvable(island.count, world.config.debris)),
-			parent = body.model.Parent,
+			-- Binned sources let fragments auto-bin (Bodys vs Chunks by
+			-- anchored state); explicitly parented sources pass it down.
+			parent = if Bin.isBin(body.model.Parent) then nil else body.model.Parent,
 		})
 		if staysAnchored then
 			fragment._stressDirty = true

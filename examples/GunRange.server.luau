@@ -144,7 +144,7 @@ local function tracer(from: Vector3, to: Vector3, thickness: number)
 	beam.Color = Color3.fromRGB(255, 200, 90)
 	beam.Size = Vector3.new(thickness, thickness, (to - from).Magnitude)
 	beam.CFrame = CFrame.lookAt((from + to) / 2, to)
-	beam.Parent = workspace
+	beam.Parent = Chunkr.Bin.trash() -- no specific class: _Bin/Trash
 	DebrisService:AddItem(beam, 0.07)
 end
 

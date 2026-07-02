@@ -79,10 +79,13 @@ local World = require(script._Main.World)
 local Server = require(script._Main.Server)
 local Client = require(script._Main.Client)
 
+local Bin = require(script._Utility.Bin)
+
 local Chunkr = {}
 Chunkr.__index = Chunkr
 
 -- Submodules / authoring surface.
+Chunkr.Bin = Bin
 Chunkr.Materials = Materials
 Chunkr.Fracture = Fracture
 Chunkr.FracturePattern = FracturePattern
@@ -559,6 +562,7 @@ local Materials = require(script.Parent.Parent._Patterns.Materials)
 local Carve = require(script.Parent.Parent._Patterns.Carve)
 local Damage = require(script.Parent.Parent._Patterns.Damage)
 local Events = require(script.Parent.Parent._Utility.Events)
+local Bin = require(script.Parent.Parent._Utility.Bin)
 
 local Body = {}
 Body.__index = Body
@@ -640,7 +644,9 @@ function Body.fromVolume(volume: Volume.Volume, config: Config?): Body
 	}, Body)
 
 	model:SetAttribute(Body.ID_ATTRIBUTE, self.id)
-	model.Parent = cfg.parent or workspace
+	-- Default home: structural bodies under _Bin/Bodys, dynamic ones under
+	-- _Bin/Chunks. An explicit parent always wins.
+	model.Parent = cfg.parent or (if self.anchored then Bin.bodies() else Bin.chunks())
 	return self
 end
 
@@ -847,6 +853,11 @@ function Body.SetAnchored(self: Body, anchored: boolean)
 		if part:IsA("BasePart") then
 			part.Anchored = anchored
 		end
+	end
+	-- Binned bodies follow their state: a collapsing structure moves from
+	-- _Bin/Bodys into _Bin/Chunks. Explicitly parented bodies stay put.
+	if Bin.isBin(self.model.Parent) then
+		self.model.Parent = if anchored then Bin.bodies() else Bin.chunks()
 	end
 end
 
@@ -1421,6 +1432,7 @@ local Debris = require(script.Parent.Parent._Patterns.Debris)
 local Topology = require(script.Parent.Parent._Patterns.Topology)
 local Grid = require(script.Parent.Parent._Utility.Grid)
 local Events = require(script.Parent.Parent._Utility.Events)
+local Bin = require(script.Parent.Parent._Utility.Bin)
 
 local Simulation = {}
 
@@ -1533,7 +1545,9 @@ local function applySplit(world: any, body: Body.Body, islands: { Topology.Islan
 			cframe = sourcePivot * CFrame.new(Vector3.new(island.ox, island.oy, island.oz) * body.voxelSize),
 			anchored = staysAnchored,
 			carvable = body.carvable and (staysAnchored or Debris.isCarvable(island.count, world.config.debris)),
-			parent = body.model.Parent,
+			-- Binned sources let fragments auto-bin (Bodys vs Chunks by
+			-- anchored state); explicitly parented sources pass it down.
+			parent = if Bin.isBin(body.model.Parent) then nil else body.model.Parent,
 		})
 		if staysAnchored then
 			fragment._stressDirty = true
@@ -9752,6 +9766,71 @@ end
 return Topology
 ]])
 local _14 = folder("_Utility", _1)
+mod("Bin", _14, [[
+-- Workspace organisation: everything Chunkr spawns lives under a single
+-- Workspace/_Bin container instead of littering the root.
+--
+--   _Bin/Bodys   structural voxel bodies (anchored)
+--   _Bin/Chunks  dynamic bodies - fragments, debris, thrown props
+--   _Bin/Voxels  standalone voxel parts (games can use this for loose
+--                single-voxel effects, crumble visuals, ...)
+--   _Bin/Trash   anything without a specific class - tracers, scratch
+--                instances, short-lived effects
+--
+-- Bodies re-bin automatically when their anchored state flips (a collapsing
+-- structure moves Bodys -> Chunks). Explicit `parent` configs always win -
+-- the bin is only the default home.
+
+local Bin = {}
+
+local root: Folder? = nil
+local children: { [string]: Folder } = {}
+
+local function folder(name: string): Folder
+	if not root or not root.Parent then
+		root = Instance.new("Folder")
+		root.Name = "_Bin"
+		root.Parent = workspace
+		table.clear(children)
+	end
+	local existing = children[name]
+	if existing and existing.Parent == root then
+		return existing
+	end
+	local child = root:FindFirstChild(name)
+	if not child then
+		child = Instance.new("Folder")
+		child.Name = name
+		child.Parent = root
+	end
+	children[name] = child :: Folder
+	return child :: Folder
+end
+
+function Bin.bodies(): Folder
+	return folder("Bodys")
+end
+
+function Bin.chunks(): Folder
+	return folder("Chunks")
+end
+
+function Bin.voxels(): Folder
+	return folder("Voxels")
+end
+
+function Bin.trash(): Folder
+	return folder("Trash")
+end
+
+-- Is this instance one of the bin folders? (Fragments of an explicitly
+-- parented body inherit its parent; fragments of a binned body re-bin.)
+function Bin.isBin(instance: Instance?): boolean
+	return instance ~= nil and root ~= nil and (instance == root or instance.Parent == root)
+end
+
+return Bin
+]])
 mod("Config", _14, [[
 -- Engine defaults + tuning knobs. Chunkr.new(config) shallow-merges over these.
 
@@ -10211,5 +10290,5 @@ end
 return Vox
 ]])
 
-print("[Chunkr] installed 64 modules (1 scripts) under ReplicatedStorage.Chunkr")
+print("[Chunkr] installed 65 modules (1 scripts) under ReplicatedStorage.Chunkr")
 return true

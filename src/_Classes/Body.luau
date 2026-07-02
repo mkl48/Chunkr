@@ -18,6 +18,7 @@ local Materials = require(script.Parent.Parent._Patterns.Materials)
 local Carve = require(script.Parent.Parent._Patterns.Carve)
 local Damage = require(script.Parent.Parent._Patterns.Damage)
 local Events = require(script.Parent.Parent._Utility.Events)
+local Bin = require(script.Parent.Parent._Utility.Bin)
 
 local Body = {}
 Body.__index = Body
@@ -99,7 +100,9 @@ function Body.fromVolume(volume: Volume.Volume, config: Config?): Body
 	}, Body)
 
 	model:SetAttribute(Body.ID_ATTRIBUTE, self.id)
-	model.Parent = cfg.parent or workspace
+	-- Default home: structural bodies under _Bin/Bodys, dynamic ones under
+	-- _Bin/Chunks. An explicit parent always wins.
+	model.Parent = cfg.parent or (if self.anchored then Bin.bodies() else Bin.chunks())
 	return self
 end
 
@@ -306,6 +309,11 @@ function Body.SetAnchored(self: Body, anchored: boolean)
 		if part:IsA("BasePart") then
 			part.Anchored = anchored
 		end
+	end
+	-- Binned bodies follow their state: a collapsing structure moves from
+	-- _Bin/Bodys into _Bin/Chunks. Explicitly parented bodies stay put.
+	if Bin.isBin(self.model.Parent) then
+		self.model.Parent = if anchored then Bin.bodies() else Bin.chunks()
 	end
 end
 

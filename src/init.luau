@@ -35,10 +35,13 @@ local World = require(script._Main.World)
 local Server = require(script._Main.Server)
 local Client = require(script._Main.Client)
 
+local Bin = require(script._Utility.Bin)
+
 local Chunkr = {}
 Chunkr.__index = Chunkr
 
 -- Submodules / authoring surface.
+Chunkr.Bin = Bin
 Chunkr.Materials = Materials
 Chunkr.Fracture = Fracture
 Chunkr.FracturePattern = FracturePattern
