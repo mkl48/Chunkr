@@ -22,13 +22,13 @@ local pending: { [number]: (any) -> () } = {}
 local nextJobId = 0
 local roundRobin = 0
 
-local function runSerial(jobType: string, a: any, b: any, c: any, d: any, e: any, f: any, g: any): any
+local function runSerial(jobType: string, a: any, b: any, c: any, d: any, e: any, f: any, g: any, h: any, i: any): any
 	if jobType == "topology" then
 		return Topology.islands(a, b, c, d)
 	elseif jobType == "boxer" then
 		return Boxer.decompose(a, b, c, d)
 	elseif jobType == "stress" then
-		return Stress.unsupported(a, b, c, d, e, f, g)
+		return Stress.unsupported(a, b, c, d, e, f, g, h, i)
 	end
 	error(`unknown job type {jobType}`)
 end

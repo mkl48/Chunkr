@@ -26,7 +26,11 @@ local Config = {
 	stress = {
 		enabled = true,
 		bodiesPerTick = 2, -- amortization
-		loadFactor = 8, -- voxels of load one voxel of strength can carry
+		loadFactor = 8, -- span: support-path cost one point of strength affords
+		-- Crush: density-weighted column load one point of strength bears
+		-- before compression failure. Glass (strength 1, density 2.5) crushes
+		-- under ~22 voxels of itself; stone towers stand for hundreds.
+		crushFactor = 55,
 	},
 
 	-- Impact / fracture

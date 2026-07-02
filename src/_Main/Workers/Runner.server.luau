@@ -14,14 +14,14 @@ local Topology = require(package._Patterns.Topology)
 local Boxer = require(package._Patterns.Boxer)
 local Stress = require(package._Patterns.Stress)
 
-actor:BindToMessageParallel("ChunkrJob", function(jobId: number, jobType: string, a, b, c, d, e, f, g)
+actor:BindToMessageParallel("ChunkrJob", function(jobId: number, jobType: string, a, b, c, d, e, f, g, h, i)
 	local result
 	if jobType == "topology" then
 		result = Topology.islands(a, b, c, d)
 	elseif jobType == "boxer" then
 		result = Boxer.decompose(a, b, c, d)
 	elseif jobType == "stress" then
-		result = Stress.unsupported(a, b, c, d, e, f, g)
+		result = Stress.unsupported(a, b, c, d, e, f, g, h, i)
 	else
 		warn(`[Chunkr] unknown worker job {jobType}`)
 		return

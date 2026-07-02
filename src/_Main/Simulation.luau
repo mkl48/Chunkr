@@ -37,6 +37,14 @@ local function strengthLut(): { [number]: number }
 	return lut
 end
 
+local function densityLut(): { [number]: number }
+	local lut = {}
+	for id, material in Materials.all() do
+		lut[id] = material.density
+	end
+	return lut
+end
+
 -- An island of an anchored body is grounded when it still touches the source
 -- volume's bottom layer (tight bounds make this a min-y check).
 local function isGrounded(island: Topology.Island): boolean
@@ -278,7 +286,7 @@ local function step(world: any)
 					volume:Set(x, y, z, 0)
 				end
 				-- Deleting marks dirty -> next tick's Topology drops the pieces.
-			end, snap, volume.sx, volume.sy, volume.sz, seeds, strengthLut(), config.stress.loadFactor)
+			end, snap, volume.sx, volume.sy, volume.sz, seeds, strengthLut(), config.stress.loadFactor, densityLut(), config.stress.crushFactor)
 		end
 	end
 

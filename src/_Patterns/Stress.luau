@@ -1,27 +1,33 @@
 --!native
--- Structural stress with directional load costs. The old model measured
--- plain graph distance to ground, which condemned any tall wall (a 30-voxel
--- glass pane "collapsed" under its own height). Real structures carry
--- compression well: support propagates UP a stack for free, sideways at a
--- cost (cantilever), and downward at double cost (hanging).
+-- Structural stress with directional load costs plus compression failure.
 --
---   step up        cost 0   (resting on the voxel below)
---   step sideways  cost 1   (unsupported overhang)
---   step down      cost 2   (dangling)
+-- SPAN failure (cantilever/hang): support propagates from grounded voxels
+-- with directional costs -
+--   step up                          cost 0  (resting on the voxel below)
+--   step sideways onto support       cost 1  (overhang above solid)
+--   step sideways into thin air      cost 2  (nothing under the destination:
+--                                             thin shelves and diagonal
+--                                             staircase "corner holds" pay
+--                                             double and let go sooner)
+--   step down                        cost 2  (dangling)
+-- A voxel breaks when its cheapest support path exceeds strength×loadFactor.
+-- Walls of any height stand; a glass cantilever snaps past ~8 voxels; steel
+-- carries long spans; diagonally-held chunks drop.
 --
--- A voxel breaks when its cheapest support path exceeds strength×loadFactor,
--- so walls of any height stand, while a glass cantilever snaps past ~8
--- voxels and steel carries long spans. Deleted voxels re-enter the normal
--- dirty -> Topology -> fall path.
+-- CRUSH failure (own weight): per column, the accumulated density-weighted
+-- load above a voxel is compared to strength×crushFactor. A too-tall glass
+-- tower crushes at its base and topples; stone bearing on wood crushes the
+-- wood. Skipped when densityLut/crushFactor are nil.
 --
--- WORKER-SAFE: no Materials registry - callers pass a strength LUT.
+-- Broken voxels re-enter the normal dirty -> Topology -> fall path.
+-- WORKER-SAFE: no Materials registry - callers pass LUTs.
 
 local Stress = {}
 
 local UNREACHED = 0xFFFF
 
 -- `seeds`: 0-based flat indices of grounded voxels. Returns 0-based indices
--- of voxels whose support cost exceeds their material's capacity.
+-- of voxels that fail by span or by crush.
 function Stress.unsupported(
 	voxels: buffer,
 	sx: number,
@@ -29,7 +35,9 @@ function Stress.unsupported(
 	sz: number,
 	seeds: { number },
 	strengthLut: { [number]: number },
-	loadFactor: number
+	loadFactor: number,
+	densityLut: { [number]: number }?,
+	crushFactor: number?
 ): { number }
 	local total = sx * sy * sz
 	local sxsz = sx * sz
@@ -86,16 +94,33 @@ function Stress.unsupported(
 					table.insert(buckets[nd], ni)
 				end
 			end
+			-- Sideways cost doubles when the destination has nothing beneath
+			-- it - thin shelves and diagonal corner-holds let go sooner.
+			local function sideCost(nx: number, ny: number, nz: number): number
+				if ny > 0 and buffer.readu16(voxels, (nx + nz * sx + (ny - 1) * sxsz) * 2) ~= 0 then
+					return 1
+				end
+				return 2
+			end
 			relax(x, y + 1, z, 0) -- stacked above: free (compression)
-			relax(x - 1, y, z, 1) -- sideways: cantilever
-			relax(x + 1, y, z, 1)
-			relax(x, y, z - 1, 1)
-			relax(x, y, z + 1, 1)
+			if x > 0 then
+				relax(x - 1, y, z, sideCost(x - 1, y, z))
+			end
+			if x + 1 < sx then
+				relax(x + 1, y, z, sideCost(x + 1, y, z))
+			end
+			if z > 0 then
+				relax(x, y, z - 1, sideCost(x, y, z - 1))
+			end
+			if z + 1 < sz then
+				relax(x, y, z + 1, sideCost(x, y, z + 1))
+			end
 			relax(x, y - 1, z, 2) -- hanging below
 		end
 	end
 
 	local broken = {}
+	local brokenFlags = buffer.create(total)
 	for index = 0, total - 1 do
 		local id = buffer.readu16(voxels, index * 2)
 		if id == 0 then
@@ -105,8 +130,45 @@ function Stress.unsupported(
 		local capacity = (strengthLut[id] or 0) * loadFactor
 		if d == UNREACHED or d > capacity then
 			table.insert(broken, index)
+			buffer.writeu8(brokenFlags, index, 1)
 		end
 	end
+
+	-- Crush pass: straight-column load approximation. Walk each column top
+	-- to bottom accumulating density; the first voxel whose load above
+	-- exceeds strength×crushFactor fails in compression. Only the FAILURE
+	-- PLANE breaks (one voxel per overload), so the overloaded top falls off
+	-- as a body while the stub keeps standing - and if the stub is still too
+	-- tall, the next stress pass crushes it again: progressive pancaking
+	-- instead of the base vaporising in one frame.
+	if densityLut and crushFactor then
+		for z = 0, sz - 1 do
+			for x = 0, sx - 1 do
+				local load = 0
+				for y = sy - 1, 0, -1 do
+					local index = x + z * sx + y * sxsz
+					local id = buffer.readu16(voxels, index * 2)
+					if id == 0 then
+						-- Gap: nothing rests through air in this cheap model.
+						load = 0
+						continue
+					end
+					if load > (strengthLut[id] or 0) * crushFactor then
+						if buffer.readu8(brokenFlags, index) == 0 then
+							table.insert(broken, index)
+							buffer.writeu8(brokenFlags, index, 1)
+						end
+						-- Everything below now only carries what's under the
+						-- break; restart the accumulation.
+						load = 0
+					else
+						load += densityLut[id] or 0
+					end
+				end
+			end
+		end
+	end
+
 	return broken
 end
 

@@ -57,18 +57,43 @@ do
 	local column = Stress.unsupported(v.voxels, 1, 40, 1, { 0 }, { [2] = 1 }, 3)
 	eq(#column, 0, "tall weak column stands (compression is free)")
 
-	-- Cantilever: horizontal beam seeded at one end; capacity 1*3 = 3
-	-- sideways steps -> x >= 4 snaps off.
+	-- Thin shelf into thin air: sideways steps with nothing beneath cost 2,
+	-- so capacity 1*4 = 4 reaches only x <= 2 -> 17 of 20 snap off.
 	local beam = Volume.new(20, 1, 1)
 	beam:FillBox(0, 0, 0, 19, 0, 0, 2)
-	local snapped = Stress.unsupported(beam.voxels, 20, 1, 1, { 0 }, { [2] = 1 }, 3)
-	eq(#snapped, 16, "cantilever snaps past capacity")
+	local snapped = Stress.unsupported(beam.voxels, 20, 1, 1, { 0 }, { [2] = 1 }, 4)
+	eq(#snapped, 17, "unsupported thin shelf pays double")
 
-	-- Same beam in steel holds the full span.
+	-- The same reach on TOP of supporting material costs 1/step: a 2-tall
+	-- slab's upper row rides the lower row -> upper reaches twice as far.
+	local slab = Volume.new(20, 2, 1)
+	slab:FillBox(0, 0, 0, 19, 1, 0, 2)
+	local slabBroken = Stress.unsupported(slab.voxels, 20, 2, 1, { 0 }, { [2] = 1 }, 4)
+	-- Lower row (thin air below): breaks past x=2. Upper row rides solid
+	-- (cost 1) but its floor vanishes... both rows tallied loosely: strictly
+	-- fewer than the 34 a pure-double model would break.
+	eq(#slabBroken < 34 and #slabBroken > 0, true, `thick slab reaches further ({#slabBroken} broken)`)
+
+	-- Steel holds the full thin span even at double cost.
 	local steelBeam = Volume.new(20, 1, 1)
 	steelBeam:FillBox(0, 0, 0, 19, 0, 0, 5)
 	local held = Stress.unsupported(steelBeam.voxels, 20, 1, 1, { 0 }, { [5] = 14 }, 3)
 	eq(#held, 0, "steel beam holds")
+
+	-- Crush: a 30-tall glass column (strength 1, density 2.5, crushFactor 20
+	-- -> bears 20/2.5 = 8 voxels of itself). Only failure PLANES break (one
+	-- voxel per overload, load resets below the break): overload occurs at
+	-- the 9th voxel from each running top -> breaks at y=20, y=11, y=2.
+	local tower = Volume.new(1, 30, 1)
+	tower:FillBox(0, 0, 0, 0, 29, 0, 3)
+	local crushed = Stress.unsupported(tower.voxels, 1, 30, 1, { 0 }, { [3] = 1 }, 8, { [3] = 2.5 }, 20)
+	eq(#crushed, 3, "glass tower breaks at failure planes")
+
+	-- Same tower without density/crush args: span-only, stands fine.
+	local tower2 = Volume.new(1, 30, 1)
+	tower2:FillBox(0, 0, 0, 0, 29, 0, 3)
+	local spanOnly = Stress.unsupported(tower2.voxels, 1, 30, 1, { 0 }, { [3] = 1 }, 8)
+	eq(#spanOnly, 0, "crush pass optional")
 
 	-- Hanging costs double: a chain dangling below its seed breaks at half
 	-- the cantilever length. Seed at the TOP (y=4), capacity 3 -> one step
