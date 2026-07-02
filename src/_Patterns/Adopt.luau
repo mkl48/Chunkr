@@ -154,6 +154,7 @@ function Adopt.part(world: any, part: BasePart): Body.Body?
 	})
 	if not part.Anchored then
 		body._pendingVelocity = part.AssemblyLinearVelocity
+		body._pendingAngularVelocity = part.AssemblyAngularVelocity
 	end
 	body.needsRemesh = true
 	world:Add(body)

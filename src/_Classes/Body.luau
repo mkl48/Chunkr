@@ -59,8 +59,9 @@ export type Body = typeof(setmetatable(
 		_remeshInFlight: boolean,
 		_topoInFlight: boolean,
 		_stressDirty: boolean,
-		-- Velocity applied on the next ApplyBoxes (fresh fragments).
+		-- Velocity applied on the next ApplyBoxes (fresh fragments/adoptees).
 		_pendingVelocity: Vector3?,
+		_pendingAngularVelocity: Vector3?,
 		-- Most recent fracture, so split fragments scatter from its point.
 		_lastFracture: { position: Vector3, impulse: number, at: number }?,
 		-- Detach-mode fracture labels awaiting a barrier Topology pass.
@@ -95,6 +96,7 @@ function Body.fromVolume(volume: Volume.Volume, config: Config?): Body
 		_topoInFlight = false,
 		_stressDirty = false,
 		_pendingVelocity = nil,
+		_pendingAngularVelocity = nil,
 		_lastFracture = nil,
 		_pendingDetach = nil,
 	}, Body)
@@ -297,6 +299,11 @@ function Body.ApplyBoxes(self: Body, boxes: { Types.Box })
 		if pending then
 			self._pendingVelocity = nil
 			root.AssemblyLinearVelocity = pending
+			local pendingAngular = self._pendingAngularVelocity
+			if pendingAngular then
+				self._pendingAngularVelocity = nil
+				root.AssemblyAngularVelocity = pendingAngular
+			end
 		else
 			root.AssemblyLinearVelocity = linVel
 			root.AssemblyAngularVelocity = angVel
