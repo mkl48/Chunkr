@@ -184,6 +184,12 @@ function Chunkr.Raycast(self: Chunkr, origin: Vector3, direction: Vector3, maxDi
 	return self.world:Raycast(origin, direction, maxDistance)
 end
 
+-- Hitscan weapon fire: raycast + fracture/dent/fatigue at the hit, scaled by
+-- `impulse` (the projectile's punch, same scale as contact impulses).
+function Chunkr.Hit(self: Chunkr, origin: Vector3, direction: Vector3, maxDistance: number, impulse: number): Types.RaycastHit?
+	return self.world:Hit(origin, direction, maxDistance, impulse)
+end
+
 function Chunkr.QuerySphere(self: Chunkr, position: Vector3, radiusStuds: number)
 	return self.world:QuerySphere(position, radiusStuds)
 end
@@ -293,8 +299,10 @@ export type Region = {
 	maxZ: number,
 }
 
--- Fracture event raised by Impact when estimated impulse beats toughness.
-export type FractureEvent = {
+-- Impact event queued for Simulation: a fracture (crack pattern) or a dent
+-- (small chip crater) at a voxel of a body.
+export type ImpactEvent = {
+	kind: "fracture" | "dent",
 	body: any, -- Body
 	-- Contact position, voxel-local integer coordinates.
 	x: number,
@@ -304,7 +312,18 @@ export type FractureEvent = {
 	face: Face,
 	impulse: number,
 	material: Material,
+	-- World-space contact point (fracture only); fragments scatter from it.
+	position: any?, -- Vector3
+	-- Dent crater radius in voxels (dent only).
+	radius: number?,
+	-- Momentum preservation (fracture via physical contact only): the dynamic
+	-- impactor part and the velocity to restore after cracks stamp.
+	_impactor: any?, -- BasePart
+	_impactorVelocity: any?, -- Vector3
 }
+
+-- Back-compat alias; fracture-shaped ImpactEvent.
+export type FractureEvent = ImpactEvent
 
 export type Face = "Top" | "Bottom" | "Left" | "Right" | "Front" | "Back"
 
@@ -566,6 +585,16 @@ export type Body = typeof(setmetatable(
 		spawnedAt: number,
 		destroyed: boolean,
 		_initialPivot: CFrame,
+		-- Runtime flags owned by Simulation/Render (declared here so no caller
+		-- ever needs an `:: any` cast - that pattern broke the parser once).
+		needsRemesh: boolean,
+		_remeshInFlight: boolean,
+		_topoInFlight: boolean,
+		_stressDirty: boolean,
+		-- Velocity applied on the next ApplyBoxes (fresh fragments).
+		_pendingVelocity: Vector3?,
+		-- Most recent fracture, so split fragments scatter from its point.
+		_lastFracture: { position: Vector3, impulse: number, at: number }?,
 	},
 	Body
 ))
@@ -591,6 +620,12 @@ function Body.fromVolume(volume: Volume.Volume, config: Config?): Body
 		spawnedAt = os.clock(),
 		destroyed = false,
 		_initialPivot = cfg.cframe or CFrame.identity,
+		needsRemesh = false,
+		_remeshInFlight = false,
+		_topoInFlight = false,
+		_stressDirty = false,
+		_pendingVelocity = nil,
+		_lastFracture = nil,
 	}, Body)
 
 	model:SetAttribute(Body.ID_ATTRIBUTE, self.id)
@@ -782,9 +817,9 @@ function Body.ApplyBoxes(self: Body, boxes: { Types.Box })
 
 	if not self.anchored then
 		-- Fresh fragment bodies get their inherited velocity on first build.
-		local pending = (self :: any)._pendingVelocity
+		local pending = self._pendingVelocity
 		if pending then
-			(self :: any)._pendingVelocity = nil
+			self._pendingVelocity = nil
 			root.AssemblyLinearVelocity = pending
 		else
 			root.AssemblyLinearVelocity = linVel
@@ -1309,10 +1344,15 @@ end
 return Server
 ]])
 mod("Simulation", _3, [[
--- The tick pipeline - single owner of system ordering (the part I said I'd
--- fight for): Impact events -> Fracture stamping -> Topology splits ->
--- Stress checks -> Debris housekeeping. Render picks up `needsRemesh` flags
--- afterwards. Server only.
+-- The tick pipeline - single owner of system ordering: Impact events ->
+-- Fracture/dent stamping -> Topology splits -> Stress checks -> Debris
+-- housekeeping. Render picks up `needsRemesh` flags afterwards. Server only.
+--
+-- Split rule for ANCHORED bodies (the neighborhood-disconnector behaviour):
+-- islands still touching the ground layer stay anchored - the largest keeps
+-- the body, other grounded islands become new anchored bodies. Ungrounded
+-- islands fall as dynamic assemblies. Slice a standing pane in half and the
+-- top half drops while the bottom keeps standing, whichever is bigger.
 
 local RunService = game:GetService("RunService")
 
@@ -1323,13 +1363,13 @@ local Anchor = require(script.Parent.Parent._Classes.Anchor)
 local Materials = require(script.Parent.Parent._Patterns.Materials)
 local Fracture = require(script.Parent.Parent._Patterns.Fracture)
 local Impact = require(script.Parent.Parent._Patterns.Impact)
+local Carve = require(script.Parent.Parent._Patterns.Carve)
 local Debris = require(script.Parent.Parent._Patterns.Debris)
+local Topology = require(script.Parent.Parent._Patterns.Topology)
 local Grid = require(script.Parent.Parent._Utility.Grid)
 local Events = require(script.Parent.Parent._Utility.Events)
 
 local Simulation = {}
-
-local Carve = require(script.Parent.Parent._Patterns.Carve)
 
 local connection: RBXScriptConnection? = nil
 local rand: () -> number = Grid.rng(os.time())
@@ -1343,14 +1383,58 @@ local function strengthLut(): { [number]: number }
 	return lut
 end
 
+-- An island of an anchored body is grounded when it still touches the source
+-- volume's bottom layer (tight bounds make this a min-y check).
+local function isGrounded(island: Topology.Island): boolean
+	return island.oy == 0
+end
+
+local function fragmentVelocity(world: any, body: Body.Body, island: Topology.Island, sourcePivot: CFrame, sourceVelocity: Vector3): Vector3
+	local velocity = sourceVelocity
+	local lastFracture = body._lastFracture
+	if lastFracture and os.clock() - lastFracture.at < 1 then
+		local impact = world.config.impact
+		local fragmentCenter = sourcePivot:PointToWorldSpace(
+			Vector3.new(island.ox + island.sx / 2, island.oy + island.sy / 2, island.oz + island.sz / 2) * body.voxelSize
+		)
+		local away = fragmentCenter - lastFracture.position
+		if away.Magnitude > 1e-3 then
+			local speed = impact.fragmentKickBase
+				+ math.min(lastFracture.impulse * impact.fragmentKickScale, impact.fragmentKickMax)
+			velocity += away.Unit * speed
+		end
+	end
+	return velocity
+end
+
 -- Islands (from a Topology job) become: the kept volume on the source body,
--- fragment bodies, or crumble events.
-local function applySplit(world: any, body: Body.Body, islands: { any })
-	-- Largest island keeps the body (its parts, anchors, damage history).
+-- new anchored bodies (grounded pieces of anchored sources), dynamic
+-- fragments, or crumble events.
+local function applySplit(world: any, body: Body.Body, islands: { Topology.Island })
 	table.sort(islands, function(a, b)
 		return a.count > b.count
 	end)
-	local kept = islands[1]
+
+	-- The kept island: for anchored bodies, the largest GROUNDED island (the
+	-- part still standing); otherwise simply the largest. An anchored body
+	-- with no grounded island left gets unanchored - the whole thing falls.
+	local keptIndex = 1
+	if body.anchored then
+		local grounded = nil
+		for i, island in islands do
+			if isGrounded(island) then
+				grounded = i
+				break -- sorted by size, first grounded is the largest grounded
+			end
+		end
+		if grounded then
+			keptIndex = grounded
+		else
+			body:SetAnchored(false)
+		end
+	end
+	local kept = islands[keptIndex]
+
 	local sourcePivot = body:GetPivot()
 	local sourceVelocity = if body.rootPart and not body.anchored
 		then body.rootPart.AssemblyLinearVelocity
@@ -1359,11 +1443,16 @@ local function applySplit(world: any, body: Body.Body, islands: { any })
 	body:ReplaceVolume(Volume.fromBuffer(kept.sx, kept.sy, kept.sz, kept.voxels), kept.ox, kept.oy, kept.oz)
 	body.needsRemesh = true
 
-	local spawned = {}
-	for i = 2, #islands do
-		local island = islands[i]
-		if Debris.classify(island.count, world.config.debris) == "crumble" then
-			-- Sample a material for the VFX event.
+	local spawned: { Body.Body } = {}
+	for i, island in islands do
+		if i == keptIndex then
+			continue
+		end
+
+		-- Grounded siblings of an anchored body keep standing as their own
+		-- anchored bodies; everything else is debris-classified.
+		local staysAnchored = body.anchored and isGrounded(island)
+		if not staysAnchored and Debris.classify(island.count, world.config.debris) == "crumble" then
 			local sampleId = 0
 			for j = 0, island.sx * island.sy * island.sz - 1 do
 				sampleId = buffer.readu16(island.voxels, j * 2)
@@ -1381,28 +1470,15 @@ local function applySplit(world: any, body: Body.Body, islands: { any })
 		local fragment = Body.fromVolume(Volume.fromBuffer(island.sx, island.sy, island.sz, island.voxels), {
 			voxelSize = body.voxelSize,
 			cframe = sourcePivot * CFrame.new(Vector3.new(island.ox, island.oy, island.oz) * body.voxelSize),
-			anchored = false,
-			carvable = body.carvable and Debris.isCarvable(island.count, world.config.debris),
+			anchored = staysAnchored,
+			carvable = body.carvable and (staysAnchored or Debris.isCarvable(island.count, world.config.debris)),
 			parent = body.model.Parent,
 		})
-
-		-- Inherit the source's velocity, plus an outward kick from a recent
-		-- fracture point so shards scatter instead of dropping in place.
-		local velocity = sourceVelocity
-		local lastFracture = (body :: any)._lastFracture
-		if lastFracture and os.clock() - lastFracture.at < 1 then
-			local impact = world.config.impact
-			local fragmentCenter = sourcePivot:PointToWorldSpace(
-				Vector3.new(island.ox + island.sx / 2, island.oy + island.sy / 2, island.oz + island.sz / 2) * body.voxelSize
-			)
-			local away = fragmentCenter - lastFracture.position
-			if away.Magnitude > 1e-3 then
-				local speed = impact.fragmentKickBase
-					+ math.min(lastFracture.impulse * impact.fragmentKickScale, impact.fragmentKickMax)
-				velocity += away.Unit * speed
-			end
+		if staysAnchored then
+			fragment._stressDirty = true
+		else
+			fragment._pendingVelocity = fragmentVelocity(world, body, island, sourcePivot, sourceVelocity)
 		end
-		(fragment :: any)._pendingVelocity = velocity
 		fragment.needsRemesh = true
 		world:Add(fragment)
 		table.insert(spawned, fragment)
@@ -1433,7 +1509,7 @@ local function applySplit(world: any, body: Body.Body, islands: { any })
 		Events.OnSplit:Fire(body, spawned)
 	end
 	if body.anchored then
-		(body :: any)._stressDirty = true
+		body._stressDirty = true
 	end
 end
 
@@ -1446,36 +1522,37 @@ local function step(world: any)
 		if body.destroyed or not body.carvable then
 			continue
 		end
-		if (event :: any).kind == "dent" then
-			local removed = Carve.sphere(body.volume, event.x + 0.5, event.y + 0.5, event.z + 0.5, (event :: any).radius)
+		if event.kind == "dent" then
+			local removed = Carve.sphere(body.volume, event.x + 0.5, event.y + 0.5, event.z + 0.5, event.radius or 1)
 			if removed > 0 then
-				Events.OnCarve:Fire(body, body:LocalToWorld(event.x, event.y, event.z), (event :: any).radius * body.voxelSize, removed)
+				Events.OnCarve:Fire(body, body:LocalToWorld(event.x, event.y, event.z), (event.radius or 1) * body.voxelSize, removed)
 			end
 			continue
 		end
 		local pattern, removed = Fracture.apply(body.volume, event, rand)
 		if removed > 0 then
 			Events.OnFracture:Fire(event, pattern)
-			-- Fragments of the coming split scatter from this point.
-			(body :: any)._lastFracture = { position = (event :: any).position, impulse = event.impulse, at = os.clock() }
-			local impactor = (event :: any)._impactor
+			if event.position then
+				body._lastFracture = { position = event.position, impulse = event.impulse, at = os.clock() }
+			end
+			local impactor = event._impactor
 			if impactor and impactor.Parent then
-				impactor.AssemblyLinearVelocity = (event :: any)._impactorVelocity
+				impactor.AssemblyLinearVelocity = event._impactorVelocity
 			end
 		end
 	end
 
 	-- 2. Dirty volumes -> Topology (islands -> splits). One job per body.
 	for _, body in world:Bodies() do
-		if body.destroyed or not body.volume.dirty or (body :: any)._topoInFlight then
+		if body.destroyed or not body.volume.dirty or body._topoInFlight then
 			continue
 		end
 		local volume = body.volume
-		volume:ClearDirty();
-		(body :: any)._topoInFlight = true
+		volume:ClearDirty()
+		body._topoInFlight = true
 
 		if volume:IsEmpty() then
-			(body :: any)._topoInFlight = false
+			body._topoInFlight = false
 			world:Remove(body)
 			continue
 		end
@@ -1483,7 +1560,7 @@ local function step(world: any)
 		local snap = buffer.create(buffer.len(volume.voxels))
 		buffer.copy(snap, 0, volume.voxels, 0)
 		Workers.dispatch("topology", function(islands)
-			(body :: any)._topoInFlight = false
+			body._topoInFlight = false
 			if body.destroyed then
 				return
 			end
@@ -1495,7 +1572,7 @@ local function step(world: any)
 			if #islands <= 1 then
 				body.needsRemesh = true
 				if body.anchored then
-					(body :: any)._stressDirty = true
+					body._stressDirty = true
 				end
 			else
 				applySplit(world, body, islands)
@@ -1510,11 +1587,11 @@ local function step(world: any)
 			if budget <= 0 then
 				break
 			end
-			if not (body :: any)._stressDirty or body.destroyed or not body.anchored or (body :: any)._topoInFlight then
+			if not body._stressDirty or body.destroyed or not body.anchored or body._topoInFlight then
 				continue
 			end
-			budget -= 1;
-			(body :: any)._stressDirty = false
+			budget -= 1
+			body._stressDirty = false
 
 			local volume = body.volume
 			-- Grounding rule v1: solid voxels on the bottom layer. TODO:
@@ -1528,7 +1605,7 @@ local function step(world: any)
 				end
 			end
 			if #seeds == 0 then
-				-- Nothing grounded: the whole body should fall. Unanchor it.
+				-- Nothing grounded: the whole body falls.
 				body:SetAnchored(false)
 				continue
 			end
@@ -1745,6 +1822,7 @@ local Volume = require(script.Parent.Parent._Classes.Volume)
 local Blueprint = require(script.Parent.Parent._Classes.Blueprint)
 local Materials = require(script.Parent.Parent._Patterns.Materials)
 local Fracture = require(script.Parent.Parent._Patterns.Fracture)
+local Impact = require(script.Parent.Parent._Patterns.Impact)
 local Raycast = require(script.Parent.Parent._Utility.Raycast)
 local Query = require(script.Parent.Parent._Utility.Query)
 local Grid = require(script.Parent.Parent._Utility.Grid)
@@ -1856,7 +1934,7 @@ function World.Explode(self: World, position: Vector3, radiusStuds: number, powe
 		removed += carved
 		if carved > 0 then
 			-- Fragments of the coming split scatter from the blast centre.
-			(body :: any)._lastFracture = { position = position, impulse = power * 800, at = os.clock() }
+			body._lastFracture = { position = position, impulse = power * 800, at = os.clock() }
 			if self.config.impact.rimFracture and body.carvable then
 				fractureRim(self, body, position, radiusStuds)
 			end
@@ -1886,6 +1964,24 @@ function World.CutRay(self: World, origin: Vector3, target: Vector3, thicknessSt
 		end
 	end
 	return removed
+end
+
+-- Hitscan: raycast + route the hit through the same fracture/dent/fatigue
+-- decision as a physical contact. `impulse` is the projectile's punch in the
+-- same N·s scale as contact impulses - weapons pick a number per calibre.
+-- Fires OnImpact; Simulation applies the queued consequence next tick.
+-- Returns the hit (nil on miss).
+function World.Hit(self: World, origin: Vector3, direction: Vector3, maxDistance: number, impulse: number): Types.RaycastHit?
+	local hit = self:Raycast(origin, direction, maxDistance)
+	if not hit then
+		return nil
+	end
+	local body = hit.body
+	Events.OnImpact:Fire(body, nil, hit.position, -direction.Unit, impulse)
+	if body.carvable then
+		Impact.resolve(self.config, body, hit.position, direction.Unit, impulse)
+	end
+	return hit
 end
 
 -- ---------------------------------------------------------------- queries
@@ -8906,7 +9002,7 @@ type Cached = { v: Vector3, w: Vector3, at: number }
 local world: any = nil
 local config: any = nil
 local cache: { [BasePart]: Cached } = {}
-local queue: { Types.FractureEvent } = {}
+local queue: { Types.ImpactEvent } = {}
 -- One fracture consideration per body pair per window, or a single Touched
 -- burst (many parts) floods the queue with duplicate cracks.
 local recentPairs: { [string]: number } = {}
@@ -8968,10 +9064,23 @@ local function onTouched(ourPart: BasePart, otherPart: BasePart)
 
 	Events.OnImpact:Fire(body, otherPart, contact, -relVel.Unit, impulse)
 
+	local event = Impact.resolve(config, body, contact, relVel.Unit, impulse)
+	if event and event.kind == "fracture" and not otherPart.Anchored then
+		-- Momentum preservation, consumed by Simulation post-stamp.
+		event._impactor = otherPart
+		event._impactorVelocity = vOther * config.impact.momentumKeep
+	end
+end
+
+-- Shared hit resolution: the fracture-or-dent-or-fatigue decision for a world
+-- contact travelling `travelDir` with estimated impulse J. Used by physical
+-- contacts (above) and hitscan weapons (World:Hit). Queues and returns the
+-- event, or nil when the hit only accumulates damage.
+function Impact.resolve(cfg: any, body: any, contact: Vector3, travelDir: Vector3, impulse: number): Types.ImpactEvent?
 	-- Find the voxel + material at the contact (probe inward along the
-	-- impact direction when the surface cell has already been carved).
+	-- travel direction when the surface cell has already been carved).
 	local lx, ly, lz = body:WorldToLocal(contact)
-	local dxl, dyl, dzl = body:WorldToLocalDirection(relVel.Unit)
+	local dxl, dyl, dzl = body:WorldToLocalDirection(travelDir)
 	local x, y, z = math.floor(lx), math.floor(ly), math.floor(lz)
 	local id = body.volume:GetSafe(x, y, z)
 	for probe = 1, 2 do
@@ -8985,13 +9094,13 @@ local function onTouched(ourPart: BasePart, otherPart: BasePart)
 	end
 	local material = Materials.byId(id)
 	if not material then
-		return
+		return nil
 	end
 
 	local effective = impulse + Damage.get(body.damage, x, y, z)
 	if effective >= material.toughness and material.fractureTable then
 		Damage.clear(body.damage, x, y, z)
-		table.insert(queue, {
+		local event: Types.ImpactEvent = {
 			kind = "fracture",
 			body = body,
 			x = x,
@@ -9000,27 +9109,32 @@ local function onTouched(ourPart: BasePart, otherPart: BasePart)
 			face = Grid.dominantFace(-dxl, -dyl, -dzl) :: Types.Face,
 			impulse = effective,
 			material = material,
-			-- World contact point; Simulation kicks fragments outward from it.
+			-- Fragments of the coming split scatter from this point.
 			position = contact,
-			-- Momentum preservation, consumed by Simulation post-stamp.
-			_impactor = if not otherPart.Anchored then otherPart else nil,
-			_impactorVelocity = vOther * config.impact.momentumKeep,
-		} :: any)
-	else
-		Damage.accumulate(body.damage, x, y, z, impulse * 0.5)
-		-- Dent: hard-but-not-fracturing hits chip a visible crater.
-		if config.impact.dents and material.toughness < math.huge and effective >= material.toughness * config.impact.dentRatio then
-			local overshoot = effective / material.toughness -- dentRatio..1
-			table.insert(queue, {
-				kind = "dent",
-				body = body,
-				x = x,
-				y = y,
-				z = z,
-				radius = math.min(0.8 + overshoot * 1.5, config.impact.dentMaxRadius),
-			} :: any)
-		end
+		}
+		table.insert(queue, event)
+		return event
 	end
+
+	Damage.accumulate(body.damage, x, y, z, impulse * 0.5)
+	-- Dent: hard-but-not-fracturing hits chip a visible crater.
+	if cfg.impact.dents and material.toughness < math.huge and effective >= material.toughness * cfg.impact.dentRatio then
+		local overshoot = effective / material.toughness -- dentRatio..1
+		local event: Types.ImpactEvent = {
+			kind = "dent",
+			body = body,
+			x = x,
+			y = y,
+			z = z,
+			face = Grid.dominantFace(-dxl, -dyl, -dzl) :: Types.Face,
+			impulse = effective,
+			material = material,
+			radius = math.min(0.8 + overshoot * 1.5, cfg.impact.dentMaxRadius),
+		}
+		table.insert(queue, event)
+		return event
+	end
+	return nil
 end
 
 local function watchPart(part: Instance)
@@ -9071,7 +9185,7 @@ function Impact.stop()
 end
 
 -- Simulation drains once per tick.
-function Impact.drain(): { Types.FractureEvent }
+function Impact.drain(): { Types.ImpactEvent }
 	if #queue == 0 then
 		return queue
 	end

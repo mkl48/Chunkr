@@ -52,6 +52,16 @@ export type Body = typeof(setmetatable(
 		spawnedAt: number,
 		destroyed: boolean,
 		_initialPivot: CFrame,
+		-- Runtime flags owned by Simulation/Render (declared here so no caller
+		-- ever needs an `:: any` cast - that pattern broke the parser once).
+		needsRemesh: boolean,
+		_remeshInFlight: boolean,
+		_topoInFlight: boolean,
+		_stressDirty: boolean,
+		-- Velocity applied on the next ApplyBoxes (fresh fragments).
+		_pendingVelocity: Vector3?,
+		-- Most recent fracture, so split fragments scatter from its point.
+		_lastFracture: { position: Vector3, impulse: number, at: number }?,
 	},
 	Body
 ))
@@ -77,6 +87,12 @@ function Body.fromVolume(volume: Volume.Volume, config: Config?): Body
 		spawnedAt = os.clock(),
 		destroyed = false,
 		_initialPivot = cfg.cframe or CFrame.identity,
+		needsRemesh = false,
+		_remeshInFlight = false,
+		_topoInFlight = false,
+		_stressDirty = false,
+		_pendingVelocity = nil,
+		_lastFracture = nil,
 	}, Body)
 
 	model:SetAttribute(Body.ID_ATTRIBUTE, self.id)
@@ -268,9 +284,9 @@ function Body.ApplyBoxes(self: Body, boxes: { Types.Box })
 
 	if not self.anchored then
 		-- Fresh fragment bodies get their inherited velocity on first build.
-		local pending = (self :: any)._pendingVelocity
+		local pending = self._pendingVelocity
 		if pending then
-			(self :: any)._pendingVelocity = nil
+			self._pendingVelocity = nil
 			root.AssemblyLinearVelocity = pending
 		else
 			root.AssemblyLinearVelocity = linVel

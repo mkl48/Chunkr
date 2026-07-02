@@ -66,8 +66,10 @@ export type Region = {
 	maxZ: number,
 }
 
--- Fracture event raised by Impact when estimated impulse beats toughness.
-export type FractureEvent = {
+-- Impact event queued for Simulation: a fracture (crack pattern) or a dent
+-- (small chip crater) at a voxel of a body.
+export type ImpactEvent = {
+	kind: "fracture" | "dent",
 	body: any, -- Body
 	-- Contact position, voxel-local integer coordinates.
 	x: number,
@@ -77,7 +79,18 @@ export type FractureEvent = {
 	face: Face,
 	impulse: number,
 	material: Material,
+	-- World-space contact point (fracture only); fragments scatter from it.
+	position: any?, -- Vector3
+	-- Dent crater radius in voxels (dent only).
+	radius: number?,
+	-- Momentum preservation (fracture via physical contact only): the dynamic
+	-- impactor part and the velocity to restore after cracks stamp.
+	_impactor: any?, -- BasePart
+	_impactorVelocity: any?, -- Vector3
 }
+
+-- Back-compat alias; fracture-shaped ImpactEvent.
+export type FractureEvent = ImpactEvent
 
 export type Face = "Top" | "Bottom" | "Left" | "Right" | "Front" | "Back"
 

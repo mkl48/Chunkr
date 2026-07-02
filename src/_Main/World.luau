@@ -7,6 +7,7 @@ local Volume = require(script.Parent.Parent._Classes.Volume)
 local Blueprint = require(script.Parent.Parent._Classes.Blueprint)
 local Materials = require(script.Parent.Parent._Patterns.Materials)
 local Fracture = require(script.Parent.Parent._Patterns.Fracture)
+local Impact = require(script.Parent.Parent._Patterns.Impact)
 local Raycast = require(script.Parent.Parent._Utility.Raycast)
 local Query = require(script.Parent.Parent._Utility.Query)
 local Grid = require(script.Parent.Parent._Utility.Grid)
@@ -118,7 +119,7 @@ function World.Explode(self: World, position: Vector3, radiusStuds: number, powe
 		removed += carved
 		if carved > 0 then
 			-- Fragments of the coming split scatter from the blast centre.
-			(body :: any)._lastFracture = { position = position, impulse = power * 800, at = os.clock() }
+			body._lastFracture = { position = position, impulse = power * 800, at = os.clock() }
 			if self.config.impact.rimFracture and body.carvable then
 				fractureRim(self, body, position, radiusStuds)
 			end
@@ -148,6 +149,24 @@ function World.CutRay(self: World, origin: Vector3, target: Vector3, thicknessSt
 		end
 	end
 	return removed
+end
+
+-- Hitscan: raycast + route the hit through the same fracture/dent/fatigue
+-- decision as a physical contact. `impulse` is the projectile's punch in the
+-- same N·s scale as contact impulses - weapons pick a number per calibre.
+-- Fires OnImpact; Simulation applies the queued consequence next tick.
+-- Returns the hit (nil on miss).
+function World.Hit(self: World, origin: Vector3, direction: Vector3, maxDistance: number, impulse: number): Types.RaycastHit?
+	local hit = self:Raycast(origin, direction, maxDistance)
+	if not hit then
+		return nil
+	end
+	local body = hit.body
+	Events.OnImpact:Fire(body, nil, hit.position, -direction.Unit, impulse)
+	if body.carvable then
+		Impact.resolve(self.config, body, hit.position, direction.Unit, impulse)
+	end
+	return hit
 end
 
 -- ---------------------------------------------------------------- queries

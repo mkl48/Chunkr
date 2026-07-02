@@ -140,6 +140,12 @@ function Chunkr.Raycast(self: Chunkr, origin: Vector3, direction: Vector3, maxDi
 	return self.world:Raycast(origin, direction, maxDistance)
 end
 
+-- Hitscan weapon fire: raycast + fracture/dent/fatigue at the hit, scaled by
+-- `impulse` (the projectile's punch, same scale as contact impulses).
+function Chunkr.Hit(self: Chunkr, origin: Vector3, direction: Vector3, maxDistance: number, impulse: number): Types.RaycastHit?
+	return self.world:Hit(origin, direction, maxDistance, impulse)
+end
+
 function Chunkr.QuerySphere(self: Chunkr, position: Vector3, radiusStuds: number)
 	return self.world:QuerySphere(position, radiusStuds)
 end

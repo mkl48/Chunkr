@@ -27,7 +27,7 @@ type Cached = { v: Vector3, w: Vector3, at: number }
 local world: any = nil
 local config: any = nil
 local cache: { [BasePart]: Cached } = {}
-local queue: { Types.FractureEvent } = {}
+local queue: { Types.ImpactEvent } = {}
 -- One fracture consideration per body pair per window, or a single Touched
 -- burst (many parts) floods the queue with duplicate cracks.
 local recentPairs: { [string]: number } = {}
@@ -89,10 +89,23 @@ local function onTouched(ourPart: BasePart, otherPart: BasePart)
 
 	Events.OnImpact:Fire(body, otherPart, contact, -relVel.Unit, impulse)
 
+	local event = Impact.resolve(config, body, contact, relVel.Unit, impulse)
+	if event and event.kind == "fracture" and not otherPart.Anchored then
+		-- Momentum preservation, consumed by Simulation post-stamp.
+		event._impactor = otherPart
+		event._impactorVelocity = vOther * config.impact.momentumKeep
+	end
+end
+
+-- Shared hit resolution: the fracture-or-dent-or-fatigue decision for a world
+-- contact travelling `travelDir` with estimated impulse J. Used by physical
+-- contacts (above) and hitscan weapons (World:Hit). Queues and returns the
+-- event, or nil when the hit only accumulates damage.
+function Impact.resolve(cfg: any, body: any, contact: Vector3, travelDir: Vector3, impulse: number): Types.ImpactEvent?
 	-- Find the voxel + material at the contact (probe inward along the
-	-- impact direction when the surface cell has already been carved).
+	-- travel direction when the surface cell has already been carved).
 	local lx, ly, lz = body:WorldToLocal(contact)
-	local dxl, dyl, dzl = body:WorldToLocalDirection(relVel.Unit)
+	local dxl, dyl, dzl = body:WorldToLocalDirection(travelDir)
 	local x, y, z = math.floor(lx), math.floor(ly), math.floor(lz)
 	local id = body.volume:GetSafe(x, y, z)
 	for probe = 1, 2 do
@@ -106,13 +119,13 @@ local function onTouched(ourPart: BasePart, otherPart: BasePart)
 	end
 	local material = Materials.byId(id)
 	if not material then
-		return
+		return nil
 	end
 
 	local effective = impulse + Damage.get(body.damage, x, y, z)
 	if effective >= material.toughness and material.fractureTable then
 		Damage.clear(body.damage, x, y, z)
-		table.insert(queue, {
+		local event: Types.ImpactEvent = {
 			kind = "fracture",
 			body = body,
 			x = x,
@@ -121,27 +134,32 @@ local function onTouched(ourPart: BasePart, otherPart: BasePart)
 			face = Grid.dominantFace(-dxl, -dyl, -dzl) :: Types.Face,
 			impulse = effective,
 			material = material,
-			-- World contact point; Simulation kicks fragments outward from it.
+			-- Fragments of the coming split scatter from this point.
 			position = contact,
-			-- Momentum preservation, consumed by Simulation post-stamp.
-			_impactor = if not otherPart.Anchored then otherPart else nil,
-			_impactorVelocity = vOther * config.impact.momentumKeep,
-		} :: any)
-	else
-		Damage.accumulate(body.damage, x, y, z, impulse * 0.5)
-		-- Dent: hard-but-not-fracturing hits chip a visible crater.
-		if config.impact.dents and material.toughness < math.huge and effective >= material.toughness * config.impact.dentRatio then
-			local overshoot = effective / material.toughness -- dentRatio..1
-			table.insert(queue, {
-				kind = "dent",
-				body = body,
-				x = x,
-				y = y,
-				z = z,
-				radius = math.min(0.8 + overshoot * 1.5, config.impact.dentMaxRadius),
-			} :: any)
-		end
+		}
+		table.insert(queue, event)
+		return event
 	end
+
+	Damage.accumulate(body.damage, x, y, z, impulse * 0.5)
+	-- Dent: hard-but-not-fracturing hits chip a visible crater.
+	if cfg.impact.dents and material.toughness < math.huge and effective >= material.toughness * cfg.impact.dentRatio then
+		local overshoot = effective / material.toughness -- dentRatio..1
+		local event: Types.ImpactEvent = {
+			kind = "dent",
+			body = body,
+			x = x,
+			y = y,
+			z = z,
+			face = Grid.dominantFace(-dxl, -dyl, -dzl) :: Types.Face,
+			impulse = effective,
+			material = material,
+			radius = math.min(0.8 + overshoot * 1.5, cfg.impact.dentMaxRadius),
+		}
+		table.insert(queue, event)
+		return event
+	end
+	return nil
 end
 
 local function watchPart(part: Instance)
@@ -192,7 +210,7 @@ function Impact.stop()
 end
 
 -- Simulation drains once per tick.
-function Impact.drain(): { Types.FractureEvent }
+function Impact.drain(): { Types.ImpactEvent }
 	if #queue == 0 then
 		return queue
 	end

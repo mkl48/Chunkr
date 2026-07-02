@@ -54,6 +54,10 @@ world:CutRay(a, b, 0.4)
 -- Voxel-accurate queries for tools/weapons.
 local hit = world:Raycast(camera.CFrame.Position, look, 200)
 -- hit.body, hit.material, hit.face, hit.position
+
+-- Hitscan weapons: raycast + the same fracture/dent/fatigue decision as a
+-- physical contact, scaled by the projectile's impulse.
+world:Hit(origin, direction, 200, 150) -- e.g. a rifle round
 ```
 
 Client: `Chunkr.client().start()`, then `Chunkr.Events.OnFx` for VFX payloads
@@ -99,6 +103,18 @@ lune run tests/fracture.spec.luau  # orientations, generators, bands, damage
 lune run tests/systems.spec.luau   # Blueprint, Stress, DDA raycast, Vox, Debris
 lune run tests/pipeline.spec.luau  # brick-vs-glass-wall, end to end
 ```
+
+## Examples
+
+`rojo build place.project.json` bundles `examples/` into ServerScriptService.
+One example script runs at a time (one world per server) - flip the
+`Disabled` flags to switch:
+
+- **GunRange** (enabled) - turret cycles pistol/rifle/cannon across
+  Glass/Wood/Stone/Concrete/Steel panels: fatigue breaks, dents, grain
+  splits, anchored marker lamps dying with their host voxels
+- **DemolitionRange** (disabled) - bricks vs a glass pane, explosions vs a
+  stone tower, laser cuts vs a wood wall
 
 ## Development
 
