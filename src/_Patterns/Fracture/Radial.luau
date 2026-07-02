@@ -21,7 +21,8 @@ function Radial.generate(size: number, options: Options?): FracturePattern.Fract
 	local rand = Grid.rng(opts.seed or 1)
 	local spokeCount = opts.spokes or 7
 	local ringCount = opts.rings or 2
-	local crackWidth = opts.crackWidth or 0.6
+	-- Kept thin on purpose: cracks should sever shards, not erase the pane.
+	local crackWidth = opts.crackWidth or 0.45
 	local c = (size - 1) / 2
 	local maxR = size / 2
 

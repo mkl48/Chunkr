@@ -6,8 +6,10 @@ local Body = require(script.Parent.Parent._Classes.Body)
 local Volume = require(script.Parent.Parent._Classes.Volume)
 local Blueprint = require(script.Parent.Parent._Classes.Blueprint)
 local Materials = require(script.Parent.Parent._Patterns.Materials)
+local Fracture = require(script.Parent.Parent._Patterns.Fracture)
 local Raycast = require(script.Parent.Parent._Utility.Raycast)
 local Query = require(script.Parent.Parent._Utility.Query)
+local Grid = require(script.Parent.Parent._Utility.Grid)
 local Events = require(script.Parent.Parent._Utility.Events)
 
 local World = {}
@@ -67,6 +69,44 @@ function World.CarveSphere(self: World, position: Vector3, radiusStuds: number, 
 	return removed
 end
 
+local worldRand = Grid.rng(os.time() + 7)
+
+-- Cracks the crater rim with the material's own fracture patterns, so blasts
+-- shed chunks instead of leaving a surgical sphere. Samples random points
+-- just outside the carved radius and stamps the low fracture band there.
+local function fractureRim(self: World, body: any, position: Vector3, radiusStuds: number)
+	local impact = self.config.impact
+	local cx, cy, cz = body:WorldToLocal(position)
+	local rimVoxels = (radiusStuds / body.voxelSize) * 0.9
+	for _ = 1, impact.rimSamples do
+		-- Random direction on the sphere.
+		local theta = worldRand() * math.pi * 2
+		local u = worldRand() * 2 - 1
+		local s = math.sqrt(math.max(0, 1 - u * u))
+		local dx, dy, dz = s * math.cos(theta), u, s * math.sin(theta)
+		local x = math.floor(cx + dx * rimVoxels)
+		local y = math.floor(cy + dy * rimVoxels)
+		local z = math.floor(cz + dz * rimVoxels)
+		local material = Materials.byId(body.volume:GetSafe(x, y, z))
+		if material and material.fractureTable then
+			local event = {
+				body = body,
+				x = x,
+				y = y,
+				z = z,
+				face = Grid.dominantFace(-dx, -dy, -dz),
+				-- Low band on purpose: rim chunks, not a second explosion.
+				impulse = material.toughness * 1.5,
+				material = material,
+			}
+			local _, removed = Fracture.apply(body.volume, event :: any, worldRand)
+			if removed > 0 then
+				Events.OnFracture:Fire(event, nil)
+			end
+		end
+	end
+end
+
 function World.Explode(self: World, position: Vector3, radiusStuds: number, power: number): number
 	local removed = 0
 	for _, body in self.bodies do
@@ -74,7 +114,15 @@ function World.Explode(self: World, position: Vector3, radiusStuds: number, powe
 		if (center - position).Magnitude > radius + radiusStuds then
 			continue
 		end
-		removed += body:Explode(position, radiusStuds, power)
+		local carved = body:Explode(position, radiusStuds, power)
+		removed += carved
+		if carved > 0 then
+			-- Fragments of the coming split scatter from the blast centre.
+			(body :: any)._lastFracture = { position = position, impulse = power * 800, at = os.clock() }
+			if self.config.impact.rimFracture and body.carvable then
+				fractureRim(self, body, position, radiusStuds)
+			end
+		end
 		-- Blast impulse on dynamic survivors.
 		local root = body.rootPart
 		if root and not body.anchored then

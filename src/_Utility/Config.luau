@@ -16,9 +16,9 @@ local Config = {
 
 	-- Debris policy
 	debris = {
-		minVoxels = 6, -- islands smaller than this become VFX events, not bodies
-		maxDynamicBodies = 128,
-		despawnSeconds = 20, -- sleeping debris older than this despawns
+		minVoxels = 3, -- islands smaller than this become VFX events, not bodies
+		maxDynamicBodies = 192,
+		despawnSeconds = 30, -- sleeping debris older than this despawns
 		carvableMinVoxels = 64, -- fragments below this are inert (not re-carvable)
 	},
 
@@ -35,6 +35,20 @@ local Config = {
 		restitution = 0.3, -- e used in J ≈ m_eff · v_rel · (1+e)
 		momentumKeep = 0.65, -- fraction of pre-impact velocity restored on punch-through
 		explosionKick = 2, -- velocity kick multiplier on dynamic bodies in a blast
+		-- Fragments fly outward from the fracture point: base + impulse-scaled
+		-- speed (studs/s), capped so glass doesn't go orbital.
+		fragmentKickBase = 4,
+		fragmentKickScale = 0.004,
+		fragmentKickMax = 28,
+		-- Dents: sub-fracture hits chip a small crater at the contact once
+		-- J >= dentRatio × toughness. Radius grows with overshoot, in voxels.
+		dents = true,
+		dentRatio = 0.35,
+		dentMaxRadius = 2.5,
+		-- Explosions crack the crater rim with the material's own fracture
+		-- patterns (chunks fall off) instead of leaving a clean sphere.
+		rimFracture = true,
+		rimSamples = 3,
 	},
 
 	-- Networking

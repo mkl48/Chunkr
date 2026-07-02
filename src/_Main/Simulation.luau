@@ -18,6 +18,8 @@ local Events = require(script.Parent.Parent._Utility.Events)
 
 local Simulation = {}
 
+local Carve = require(script.Parent.Parent._Patterns.Carve)
+
 local connection: RBXScriptConnection? = nil
 local rand: () -> number = Grid.rng(os.time())
 local lastDespawnSweep = 0
@@ -71,8 +73,25 @@ local function applySplit(world: any, body: Body.Body, islands: { any })
 			anchored = false,
 			carvable = body.carvable and Debris.isCarvable(island.count, world.config.debris),
 			parent = body.model.Parent,
-		});
-		(fragment :: any)._pendingVelocity = sourceVelocity
+		})
+
+		-- Inherit the source's velocity, plus an outward kick from a recent
+		-- fracture point so shards scatter instead of dropping in place.
+		local velocity = sourceVelocity
+		local lastFracture = (body :: any)._lastFracture
+		if lastFracture and os.clock() - lastFracture.at < 1 then
+			local impact = world.config.impact
+			local fragmentCenter = sourcePivot:PointToWorldSpace(
+				Vector3.new(island.ox + island.sx / 2, island.oy + island.sy / 2, island.oz + island.sz / 2) * body.voxelSize
+			)
+			local away = fragmentCenter - lastFracture.position
+			if away.Magnitude > 1e-3 then
+				local speed = impact.fragmentKickBase
+					+ math.min(lastFracture.impulse * impact.fragmentKickScale, impact.fragmentKickMax)
+				velocity += away.Unit * speed
+			end
+		end
+		(fragment :: any)._pendingVelocity = velocity
 		fragment.needsRemesh = true
 		world:Add(fragment)
 		table.insert(spawned, fragment)
@@ -110,15 +129,24 @@ end
 local function step(world: any)
 	local config = world.config
 
-	-- 1. Fracture events -> crack stamping (+ post-hoc momentum keep).
+	-- 1. Impact events -> crack stamping / dent chipping (+ momentum keep).
 	for _, event in Impact.drain() do
 		local body = event.body
 		if body.destroyed or not body.carvable then
 			continue
 		end
+		if (event :: any).kind == "dent" then
+			local removed = Carve.sphere(body.volume, event.x + 0.5, event.y + 0.5, event.z + 0.5, (event :: any).radius)
+			if removed > 0 then
+				Events.OnCarve:Fire(body, body:LocalToWorld(event.x, event.y, event.z), (event :: any).radius * body.voxelSize, removed)
+			end
+			continue
+		end
 		local pattern, removed = Fracture.apply(body.volume, event, rand)
 		if removed > 0 then
 			Events.OnFracture:Fire(event, pattern)
+			-- Fragments of the coming split scatter from this point.
+			(body :: any)._lastFracture = { position = (event :: any).position, impulse = event.impulse, at = os.clock() }
 			local impactor = (event :: any)._impactor
 			if impactor and impactor.Parent then
 				impactor.AssemblyLinearVelocity = (event :: any)._impactorVelocity

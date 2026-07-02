@@ -1329,6 +1329,8 @@ local Events = require(script.Parent.Parent._Utility.Events)
 
 local Simulation = {}
 
+local Carve = require(script.Parent.Parent._Patterns.Carve)
+
 local connection: RBXScriptConnection? = nil
 local rand: () -> number = Grid.rng(os.time())
 local lastDespawnSweep = 0
@@ -1382,8 +1384,25 @@ local function applySplit(world: any, body: Body.Body, islands: { any })
 			anchored = false,
 			carvable = body.carvable and Debris.isCarvable(island.count, world.config.debris),
 			parent = body.model.Parent,
-		});
-		(fragment :: any)._pendingVelocity = sourceVelocity
+		})
+
+		-- Inherit the source's velocity, plus an outward kick from a recent
+		-- fracture point so shards scatter instead of dropping in place.
+		local velocity = sourceVelocity
+		local lastFracture = (body :: any)._lastFracture
+		if lastFracture and os.clock() - lastFracture.at < 1 then
+			local impact = world.config.impact
+			local fragmentCenter = sourcePivot:PointToWorldSpace(
+				Vector3.new(island.ox + island.sx / 2, island.oy + island.sy / 2, island.oz + island.sz / 2) * body.voxelSize
+			)
+			local away = fragmentCenter - lastFracture.position
+			if away.Magnitude > 1e-3 then
+				local speed = impact.fragmentKickBase
+					+ math.min(lastFracture.impulse * impact.fragmentKickScale, impact.fragmentKickMax)
+				velocity += away.Unit * speed
+			end
+		end
+		(fragment :: any)._pendingVelocity = velocity
 		fragment.needsRemesh = true
 		world:Add(fragment)
 		table.insert(spawned, fragment)
@@ -1421,15 +1440,24 @@ end
 local function step(world: any)
 	local config = world.config
 
-	-- 1. Fracture events -> crack stamping (+ post-hoc momentum keep).
+	-- 1. Impact events -> crack stamping / dent chipping (+ momentum keep).
 	for _, event in Impact.drain() do
 		local body = event.body
 		if body.destroyed or not body.carvable then
 			continue
 		end
+		if (event :: any).kind == "dent" then
+			local removed = Carve.sphere(body.volume, event.x + 0.5, event.y + 0.5, event.z + 0.5, (event :: any).radius)
+			if removed > 0 then
+				Events.OnCarve:Fire(body, body:LocalToWorld(event.x, event.y, event.z), (event :: any).radius * body.voxelSize, removed)
+			end
+			continue
+		end
 		local pattern, removed = Fracture.apply(body.volume, event, rand)
 		if removed > 0 then
 			Events.OnFracture:Fire(event, pattern)
+			-- Fragments of the coming split scatter from this point.
+			(body :: any)._lastFracture = { position = (event :: any).position, impulse = event.impulse, at = os.clock() }
 			local impactor = (event :: any)._impactor
 			if impactor and impactor.Parent then
 				impactor.AssemblyLinearVelocity = (event :: any)._impactorVelocity
@@ -1716,8 +1744,10 @@ local Body = require(script.Parent.Parent._Classes.Body)
 local Volume = require(script.Parent.Parent._Classes.Volume)
 local Blueprint = require(script.Parent.Parent._Classes.Blueprint)
 local Materials = require(script.Parent.Parent._Patterns.Materials)
+local Fracture = require(script.Parent.Parent._Patterns.Fracture)
 local Raycast = require(script.Parent.Parent._Utility.Raycast)
 local Query = require(script.Parent.Parent._Utility.Query)
+local Grid = require(script.Parent.Parent._Utility.Grid)
 local Events = require(script.Parent.Parent._Utility.Events)
 
 local World = {}
@@ -1777,6 +1807,44 @@ function World.CarveSphere(self: World, position: Vector3, radiusStuds: number, 
 	return removed
 end
 
+local worldRand = Grid.rng(os.time() + 7)
+
+-- Cracks the crater rim with the material's own fracture patterns, so blasts
+-- shed chunks instead of leaving a surgical sphere. Samples random points
+-- just outside the carved radius and stamps the low fracture band there.
+local function fractureRim(self: World, body: any, position: Vector3, radiusStuds: number)
+	local impact = self.config.impact
+	local cx, cy, cz = body:WorldToLocal(position)
+	local rimVoxels = (radiusStuds / body.voxelSize) * 0.9
+	for _ = 1, impact.rimSamples do
+		-- Random direction on the sphere.
+		local theta = worldRand() * math.pi * 2
+		local u = worldRand() * 2 - 1
+		local s = math.sqrt(math.max(0, 1 - u * u))
+		local dx, dy, dz = s * math.cos(theta), u, s * math.sin(theta)
+		local x = math.floor(cx + dx * rimVoxels)
+		local y = math.floor(cy + dy * rimVoxels)
+		local z = math.floor(cz + dz * rimVoxels)
+		local material = Materials.byId(body.volume:GetSafe(x, y, z))
+		if material and material.fractureTable then
+			local event = {
+				body = body,
+				x = x,
+				y = y,
+				z = z,
+				face = Grid.dominantFace(-dx, -dy, -dz),
+				-- Low band on purpose: rim chunks, not a second explosion.
+				impulse = material.toughness * 1.5,
+				material = material,
+			}
+			local _, removed = Fracture.apply(body.volume, event :: any, worldRand)
+			if removed > 0 then
+				Events.OnFracture:Fire(event, nil)
+			end
+		end
+	end
+end
+
 function World.Explode(self: World, position: Vector3, radiusStuds: number, power: number): number
 	local removed = 0
 	for _, body in self.bodies do
@@ -1784,7 +1852,15 @@ function World.Explode(self: World, position: Vector3, radiusStuds: number, powe
 		if (center - position).Magnitude > radius + radiusStuds then
 			continue
 		end
-		removed += body:Explode(position, radiusStuds, power)
+		local carved = body:Explode(position, radiusStuds, power)
+		removed += carved
+		if carved > 0 then
+			-- Fragments of the coming split scatter from the blast centre.
+			(body :: any)._lastFracture = { position = position, impulse = power * 800, at = os.clock() }
+			if self.config.impact.rimFracture and body.carvable then
+				fractureRim(self, body, position, radiusStuds)
+			end
+		end
 		-- Blast impulse on dynamic survivors.
 		local root = body.rootPart
 		if root and not body.anchored then
@@ -8663,7 +8739,8 @@ function Radial.generate(size: number, options: Options?): FracturePattern.Fract
 	local rand = Grid.rng(opts.seed or 1)
 	local spokeCount = opts.spokes or 7
 	local ringCount = opts.rings or 2
-	local crackWidth = opts.crackWidth or 0.6
+	-- Kept thin on purpose: cracks should sever shards, not erase the pane.
+	local crackWidth = opts.crackWidth or 0.45
 	local c = (size - 1) / 2
 	local maxR = size / 2
 
@@ -8721,12 +8798,13 @@ local Radial = require(script.Parent.Radial)
 
 local Stock = {}
 
--- Glass: full spiderweb at any fracture, denser web on hard hits.
+-- Glass: full spiderweb at any fracture, wider web on hard hits. Cracks stay
+-- thin so most of the pane survives as shards that then fall as bodies.
 function Stock.glass(toughness: number): Types.FractureTable
 	return {
 		{ pattern = Radial.generate(15, { spokes = 5, rings = 1, seed = 11 }), minImpulse = toughness, weight = 1 },
-		{ pattern = Radial.generate(21, { spokes = 8, rings = 2, seed = 12 }), minImpulse = toughness * 2, weight = 1 },
-		{ pattern = Radial.generate(27, { spokes = 11, rings = 3, seed = 13 }), minImpulse = toughness * 4, weight = 1 },
+		{ pattern = Radial.generate(23, { spokes = 7, rings = 2, seed = 12 }), minImpulse = toughness * 2, weight = 1 },
+		{ pattern = Radial.generate(31, { spokes = 9, rings = 3, seed = 13 }), minImpulse = toughness * 4, weight = 1 },
 	}
 end
 
@@ -8914,6 +8992,7 @@ local function onTouched(ourPart: BasePart, otherPart: BasePart)
 	if effective >= material.toughness and material.fractureTable then
 		Damage.clear(body.damage, x, y, z)
 		table.insert(queue, {
+			kind = "fracture",
 			body = body,
 			x = x,
 			y = y,
@@ -8921,12 +9000,26 @@ local function onTouched(ourPart: BasePart, otherPart: BasePart)
 			face = Grid.dominantFace(-dxl, -dyl, -dzl) :: Types.Face,
 			impulse = effective,
 			material = material,
+			-- World contact point; Simulation kicks fragments outward from it.
+			position = contact,
 			-- Momentum preservation, consumed by Simulation post-stamp.
 			_impactor = if not otherPart.Anchored then otherPart else nil,
 			_impactorVelocity = vOther * config.impact.momentumKeep,
 		} :: any)
 	else
 		Damage.accumulate(body.damage, x, y, z, impulse * 0.5)
+		-- Dent: hard-but-not-fracturing hits chip a visible crater.
+		if config.impact.dents and material.toughness < math.huge and effective >= material.toughness * config.impact.dentRatio then
+			local overshoot = effective / material.toughness -- dentRatio..1
+			table.insert(queue, {
+				kind = "dent",
+				body = body,
+				x = x,
+				y = y,
+				z = z,
+				radius = math.min(0.8 + overshoot * 1.5, config.impact.dentMaxRadius),
+			} :: any)
+		end
 	end
 end
 
@@ -9053,24 +9146,29 @@ return Materials
 ]])
 mod("Stress", _12, [[
 --!native
--- Structural stress, the light Teardown-ish model: multi-source BFS from
--- grounded voxels; a voxel is supported while its graph distance to ground is
--- within what its material can carry (strength × loadFactor). Everything
--- beyond that "creaks off" - Simulation deletes the unsupported voxels and
--- the usual Topology path drops them as debris.
+-- Structural stress with directional load costs. The old model measured
+-- plain graph distance to ground, which condemned any tall wall (a 30-voxel
+-- glass pane "collapsed" under its own height). Real structures carry
+-- compression well: support propagates UP a stack for free, sideways at a
+-- cost (cantilever), and downward at double cost (hanging).
 --
--- Runs amortized (a few bodies per tick) and lags destruction by design -
--- reads as creak-then-collapse rather than instant physics.
+--   step up        cost 0   (resting on the voxel below)
+--   step sideways  cost 1   (unsupported overhang)
+--   step down      cost 2   (dangling)
 --
--- WORKER-SAFE: no Materials registry - callers pass a strength LUT
--- ({ [materialId]: strength }), so the pure function travels to actors.
+-- A voxel breaks when its cheapest support path exceeds strength×loadFactor,
+-- so walls of any height stand, while a glass cantilever snaps past ~8
+-- voxels and steel carries long spans. Deleted voxels re-enter the normal
+-- dirty -> Topology -> fall path.
+--
+-- WORKER-SAFE: no Materials registry - callers pass a strength LUT.
 
 local Stress = {}
 
 local UNREACHED = 0xFFFF
 
--- `seeds`: 0-based flat indices of grounded voxels (touching an anchored
--- support). Returns 0-based indices of voxels that can no longer hold.
+-- `seeds`: 0-based flat indices of grounded voxels. Returns 0-based indices
+-- of voxels whose support cost exceeds their material's capacity.
 function Stress.unsupported(
 	voxels: buffer,
 	sx: number,
@@ -9085,45 +9183,65 @@ function Stress.unsupported(
 	local dist = buffer.create(total * 2)
 	buffer.fill(dist, 0, 0xFF) -- UNREACHED everywhere
 
-	-- Multi-source BFS over solid voxels.
-	local queue = table.create(#seeds)
+	-- Costs beyond the strongest material's capacity all break identically,
+	-- so the search can stop there.
+	local maxCapacity = 0
+	for _, strength in strengthLut do
+		local capacity = strength * loadFactor
+		if capacity > maxCapacity then
+			maxCapacity = capacity
+		end
+	end
+	local maxD = math.min(math.floor(maxCapacity) + 1, UNREACHED - 1)
+
+	-- Dial's algorithm: buckets by distance, edge weights 0/1/2.
+	local buckets: { { number } } = {}
+	for d = 0, maxD do
+		buckets[d] = {}
+	end
 	for _, index in seeds do
 		if buffer.readu16(voxels, index * 2) ~= 0 and buffer.readu16(dist, index * 2) == UNREACHED then
 			buffer.writeu16(dist, index * 2, 0)
-			table.insert(queue, index)
+			table.insert(buckets[0], index)
 		end
 	end
 
-	local head = 1
-	while head <= #queue do
-		local index = queue[head]
-		head += 1
-		local d = buffer.readu16(dist, index * 2)
-		local x = index % sx
-		local y = index // sxsz
-		local z = (index // sx) % sz
+	for d = 0, maxD do
+		local bucket = buckets[d]
+		local head = 1
+		while head <= #bucket do
+			local index = bucket[head]
+			head += 1
+			if buffer.readu16(dist, index * 2) ~= d then
+				continue -- stale entry, relaxed to a cheaper cost already
+			end
+			local x = index % sx
+			local y = index // sxsz
+			local z = (index // sx) % sz
 
-		local function try(nx: number, ny: number, nz: number)
-			if nx < 0 or ny < 0 or nz < 0 or nx >= sx or ny >= sy or nz >= sz then
-				return
+			local function relax(nx: number, ny: number, nz: number, cost: number)
+				if nx < 0 or ny < 0 or nz < 0 or nx >= sx or ny >= sy or nz >= sz then
+					return
+				end
+				local nd = d + cost
+				if nd > maxD then
+					return
+				end
+				local ni = nx + nz * sx + ny * sxsz
+				if buffer.readu16(voxels, ni * 2) ~= 0 and nd < buffer.readu16(dist, ni * 2) then
+					buffer.writeu16(dist, ni * 2, nd)
+					table.insert(buckets[nd], ni)
+				end
 			end
-			local ni = nx + nz * sx + ny * sxsz
-			if buffer.readu16(dist, ni * 2) == UNREACHED and buffer.readu16(voxels, ni * 2) ~= 0 then
-				buffer.writeu16(dist, ni * 2, d + 1)
-				table.insert(queue, ni)
-			end
+			relax(x, y + 1, z, 0) -- stacked above: free (compression)
+			relax(x - 1, y, z, 1) -- sideways: cantilever
+			relax(x + 1, y, z, 1)
+			relax(x, y, z - 1, 1)
+			relax(x, y, z + 1, 1)
+			relax(x, y - 1, z, 2) -- hanging below
 		end
-		try(x - 1, y, z)
-		try(x + 1, y, z)
-		try(x, y - 1, z)
-		try(x, y + 1, z)
-		try(x, y, z - 1)
-		try(x, y, z + 1)
 	end
 
-	-- Anything reachable but too far for its material - or unreachable
-	-- entirely - is unsupported. (Unreachable overlaps Topology's job, but
-	-- deleting it here is harmless: same islands fall out.)
 	local broken = {}
 	for index = 0, total - 1 do
 		local id = buffer.readu16(voxels, index * 2)
@@ -9267,9 +9385,9 @@ local Config = {
 
 	-- Debris policy
 	debris = {
-		minVoxels = 6, -- islands smaller than this become VFX events, not bodies
-		maxDynamicBodies = 128,
-		despawnSeconds = 20, -- sleeping debris older than this despawns
+		minVoxels = 3, -- islands smaller than this become VFX events, not bodies
+		maxDynamicBodies = 192,
+		despawnSeconds = 30, -- sleeping debris older than this despawns
 		carvableMinVoxels = 64, -- fragments below this are inert (not re-carvable)
 	},
 
@@ -9286,6 +9404,20 @@ local Config = {
 		restitution = 0.3, -- e used in J ≈ m_eff · v_rel · (1+e)
 		momentumKeep = 0.65, -- fraction of pre-impact velocity restored on punch-through
 		explosionKick = 2, -- velocity kick multiplier on dynamic bodies in a blast
+		-- Fragments fly outward from the fracture point: base + impulse-scaled
+		-- speed (studs/s), capped so glass doesn't go orbital.
+		fragmentKickBase = 4,
+		fragmentKickScale = 0.004,
+		fragmentKickMax = 28,
+		-- Dents: sub-fracture hits chip a small crater at the contact once
+		-- J >= dentRatio × toughness. Radius grows with overshoot, in voxels.
+		dents = true,
+		dentRatio = 0.35,
+		dentMaxRadius = 2.5,
+		-- Explosions crack the crater rim with the material's own fracture
+		-- patterns (chunks fall off) instead of leaving a clean sphere.
+		rimFracture = true,
+		rimSamples = 3,
 	},
 
 	-- Networking

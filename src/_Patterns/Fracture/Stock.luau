@@ -12,12 +12,13 @@ local Radial = require(script.Parent.Radial)
 
 local Stock = {}
 
--- Glass: full spiderweb at any fracture, denser web on hard hits.
+-- Glass: full spiderweb at any fracture, wider web on hard hits. Cracks stay
+-- thin so most of the pane survives as shards that then fall as bodies.
 function Stock.glass(toughness: number): Types.FractureTable
 	return {
 		{ pattern = Radial.generate(15, { spokes = 5, rings = 1, seed = 11 }), minImpulse = toughness, weight = 1 },
-		{ pattern = Radial.generate(21, { spokes = 8, rings = 2, seed = 12 }), minImpulse = toughness * 2, weight = 1 },
-		{ pattern = Radial.generate(27, { spokes = 11, rings = 3, seed = 13 }), minImpulse = toughness * 4, weight = 1 },
+		{ pattern = Radial.generate(23, { spokes = 7, rings = 2, seed = 12 }), minImpulse = toughness * 2, weight = 1 },
+		{ pattern = Radial.generate(31, { spokes = 9, rings = 3, seed = 13 }), minImpulse = toughness * 4, weight = 1 },
 	}
 end
 

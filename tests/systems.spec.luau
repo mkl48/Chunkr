@@ -50,12 +50,33 @@ end
 
 -- ------------------------------------------------- Stress
 do
-	-- 1x10x1 wooden column grounded at its base; wood strength 2, loadFactor
-	-- 3 -> voxels further than 6 steps from ground break off.
-	local v = Volume.new(1, 10, 1)
-	v:FillBox(0, 0, 0, 0, 9, 0, 2)
-	local broken = Stress.unsupported(v.voxels, 1, 10, 1, { 0 }, { [2] = 2 }, 3)
-	eq(#broken, 3, "column snaps past capacity") -- y = 7, 8, 9
+	-- Directional costs: a tall grounded column is pure compression (step-up
+	-- cost 0), so even weak material stands at any height.
+	local v = Volume.new(1, 40, 1)
+	v:FillBox(0, 0, 0, 0, 39, 0, 2)
+	local column = Stress.unsupported(v.voxels, 1, 40, 1, { 0 }, { [2] = 1 }, 3)
+	eq(#column, 0, "tall weak column stands (compression is free)")
+
+	-- Cantilever: horizontal beam seeded at one end; capacity 1*3 = 3
+	-- sideways steps -> x >= 4 snaps off.
+	local beam = Volume.new(20, 1, 1)
+	beam:FillBox(0, 0, 0, 19, 0, 0, 2)
+	local snapped = Stress.unsupported(beam.voxels, 20, 1, 1, { 0 }, { [2] = 1 }, 3)
+	eq(#snapped, 16, "cantilever snaps past capacity")
+
+	-- Same beam in steel holds the full span.
+	local steelBeam = Volume.new(20, 1, 1)
+	steelBeam:FillBox(0, 0, 0, 19, 0, 0, 5)
+	local held = Stress.unsupported(steelBeam.voxels, 20, 1, 1, { 0 }, { [5] = 14 }, 3)
+	eq(#held, 0, "steel beam holds")
+
+	-- Hanging costs double: a chain dangling below its seed breaks at half
+	-- the cantilever length. Seed at the TOP (y=4), capacity 3 -> one step
+	-- down costs 2, two steps cost 4 > 3 -> lowest 3 of 5 break.
+	local chain = Volume.new(1, 5, 1)
+	chain:FillBox(0, 0, 0, 0, 4, 0, 2)
+	local hung = Stress.unsupported(chain.voxels, 1, 5, 1, { 4 }, { [2] = 1 }, 3)
+	eq(#hung, 3, "hanging chain breaks at half reach")
 
 	-- Floating voxel (unreachable) always breaks.
 	local f = Volume.new(3, 3, 3)
@@ -64,11 +85,16 @@ do
 	local drop = Stress.unsupported(f.voxels, 3, 3, 3, { 0 }, { [2] = 2 }, 3)
 	eq(#drop, 1, "floater breaks")
 
-	-- Strong material carries the same span fine.
-	local s = Volume.new(1, 10, 1)
-	s:FillBox(0, 0, 0, 0, 9, 0, 5)
-	local ok = Stress.unsupported(s.voxels, 1, 10, 1, { 0 }, { [5] = 14 }, 3)
-	eq(#ok, 0, "steel column holds")
+	-- The bug that ate the glass pane: a 30-tall glass wall must survive a
+	-- stress pass untouched.
+	local pane = Volume.new(20, 30, 1)
+	pane:FillBox(0, 0, 0, 19, 29, 0, 3)
+	local paneSeeds = {}
+	for x = 0, 19 do
+		table.insert(paneSeeds, x)
+	end
+	local eaten = Stress.unsupported(pane.voxels, 20, 30, 1, paneSeeds, { [3] = 1 }, 8)
+	eq(#eaten, 0, "glass pane survives stress")
 end
 
 -- ------------------------------------------------- Raycast DDA

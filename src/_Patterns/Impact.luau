@@ -113,6 +113,7 @@ local function onTouched(ourPart: BasePart, otherPart: BasePart)
 	if effective >= material.toughness and material.fractureTable then
 		Damage.clear(body.damage, x, y, z)
 		table.insert(queue, {
+			kind = "fracture",
 			body = body,
 			x = x,
 			y = y,
@@ -120,12 +121,26 @@ local function onTouched(ourPart: BasePart, otherPart: BasePart)
 			face = Grid.dominantFace(-dxl, -dyl, -dzl) :: Types.Face,
 			impulse = effective,
 			material = material,
+			-- World contact point; Simulation kicks fragments outward from it.
+			position = contact,
 			-- Momentum preservation, consumed by Simulation post-stamp.
 			_impactor = if not otherPart.Anchored then otherPart else nil,
 			_impactorVelocity = vOther * config.impact.momentumKeep,
 		} :: any)
 	else
 		Damage.accumulate(body.damage, x, y, z, impulse * 0.5)
+		-- Dent: hard-but-not-fracturing hits chip a visible crater.
+		if config.impact.dents and material.toughness < math.huge and effective >= material.toughness * config.impact.dentRatio then
+			local overshoot = effective / material.toughness -- dentRatio..1
+			table.insert(queue, {
+				kind = "dent",
+				body = body,
+				x = x,
+				y = y,
+				z = z,
+				radius = math.min(0.8 + overshoot * 1.5, config.impact.dentMaxRadius),
+			} :: any)
+		end
 	end
 end
 
