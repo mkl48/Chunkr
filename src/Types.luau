@@ -22,7 +22,14 @@ export type MaterialDef = {
 	-- Crack patterns picked by impulse band + randomness. nil = never fractures
 	-- (still carvable if a brush beats `strength`).
 	fractureTable: FractureTable?,
+	-- How fracture applies its pattern. "shatter" (default) deletes the
+	-- 1-voxel crack walls; "detach" deletes NOTHING - the pattern's regions
+	-- become split barriers and the pieces come apart whole. Detach suits
+	-- planks, masonry blocks, panels; shatter suits glass and rubble.
+	breakMode: BreakMode?,
 }
+
+export type BreakMode = "shatter" | "detach"
 
 export type Material = {
 	id: number,
@@ -33,6 +40,7 @@ export type Material = {
 	color: any,
 	flammability: number,
 	fractureTable: FractureTable?,
+	breakMode: BreakMode,
 }
 
 -- One candidate crack pattern in a material's table. The engine filters

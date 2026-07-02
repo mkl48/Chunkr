@@ -25,7 +25,7 @@ function Worley.generate(size: number, options: Options?): FracturePattern.Fract
 		table.insert(seeds, { x = rand() * size, y = rand() * size, z = rand() * size })
 	end
 
-	local flags = Regions.flags(size, size, size, function(x, y, z)
+	local built = Regions.build(size, size, size, function(x, y, z)
 		local best, bestD = 0, math.huge
 		for index, s in seeds do
 			local dx, dy, dz = x + 0.5 - s.x, y + 0.5 - s.y, z + 0.5 - s.z
@@ -37,7 +37,7 @@ function Worley.generate(size: number, options: Options?): FracturePattern.Fract
 		end
 		return best
 	end)
-	return FracturePattern.new(size, size, size, flags)
+	return FracturePattern.new(size, size, size, built.flags, built.regions)
 end
 
 return Worley

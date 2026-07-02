@@ -38,11 +38,14 @@ Chunkr.Materials.define("Ceramic", {
 	color = Color3.fromRGB(226, 214, 195),
 	fractureTable = Chunkr.Fracture.Stock.stone(16), -- chunky pottery breaks
 })
+-- Wood DETACHES: fracture deletes nothing, the pieces come apart whole
+-- along the grain planes (compare with glass/ceramic shatter).
 Chunkr.Materials.define("Wood", {
 	density = 0.4,
 	strength = 2,
 	toughness = 60,
 	color = Color3.fromRGB(133, 94, 66),
+	breakMode = "detach",
 	fractureTable = Chunkr.Fracture.Stock.wood(60),
 })
 Chunkr.Materials.define("Stone", {

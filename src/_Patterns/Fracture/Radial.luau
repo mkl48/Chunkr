@@ -42,7 +42,7 @@ function Radial.generate(size: number, options: Options?): FracturePattern.Fract
 	end
 	table.sort(rings)
 
-	local flags = Regions.flags(size, size, size, function(x, y, z)
+	local built = Regions.build(size, size, size, function(x, y, z)
 		local dx, dz = x - c, z - c
 		local r = math.sqrt(dx * dx + dz * dz)
 		if r > maxR then
@@ -65,7 +65,7 @@ function Radial.generate(size: number, options: Options?): FracturePattern.Fract
 		end
 		return sector * 32 + band
 	end)
-	return FracturePattern.new(size, size, size, flags)
+	return FracturePattern.new(size, size, size, built.flags, built.regions)
 end
 
 return Radial

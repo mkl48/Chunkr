@@ -17,7 +17,7 @@ local Stress = require(package._Patterns.Stress)
 actor:BindToMessageParallel("ChunkrJob", function(jobId: number, jobType: string, a, b, c, d, e, f, g, h, i)
 	local result
 	if jobType == "topology" then
-		result = Topology.islands(a, b, c, d)
+		result = Topology.islands(a, b, c, d, e)
 	elseif jobType == "boxer" then
 		result = Boxer.decompose(a, b, c, d)
 	elseif jobType == "stress" then

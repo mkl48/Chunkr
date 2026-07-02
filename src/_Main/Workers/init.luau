@@ -24,7 +24,7 @@ local roundRobin = 0
 
 local function runSerial(jobType: string, a: any, b: any, c: any, d: any, e: any, f: any, g: any, h: any, i: any): any
 	if jobType == "topology" then
-		return Topology.islands(a, b, c, d)
+		return Topology.islands(a, b, c, d, e)
 	elseif jobType == "boxer" then
 		return Boxer.decompose(a, b, c, d)
 	elseif jobType == "stress" then

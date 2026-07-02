@@ -255,7 +255,14 @@ export type MaterialDef = {
 	-- Crack patterns picked by impulse band + randomness. nil = never fractures
 	-- (still carvable if a brush beats `strength`).
 	fractureTable: FractureTable?,
+	-- How fracture applies its pattern. "shatter" (default) deletes the
+	-- 1-voxel crack walls; "detach" deletes NOTHING - the pattern's regions
+	-- become split barriers and the pieces come apart whole. Detach suits
+	-- planks, masonry blocks, panels; shatter suits glass and rubble.
+	breakMode: BreakMode?,
 }
+
+export type BreakMode = "shatter" | "detach"
 
 export type Material = {
 	id: number,
@@ -266,6 +273,7 @@ export type Material = {
 	color: any,
 	flammability: number,
 	fractureTable: FractureTable?,
+	breakMode: BreakMode,
 }
 
 -- One candidate crack pattern in a material's table. The engine filters
@@ -595,6 +603,8 @@ export type Body = typeof(setmetatable(
 		_pendingVelocity: Vector3?,
 		-- Most recent fracture, so split fragments scatter from its point.
 		_lastFracture: { position: Vector3, impulse: number, at: number }?,
+		-- Detach-mode fracture labels awaiting a barrier Topology pass.
+		_pendingDetach: buffer?,
 	},
 	Body
 ))
@@ -626,6 +636,7 @@ function Body.fromVolume(volume: Volume.Volume, config: Config?): Body
 		_stressDirty = false,
 		_pendingVelocity = nil,
 		_lastFracture = nil,
+		_pendingDetach = nil,
 	}, Body)
 
 	model:SetAttribute(Body.ID_ATTRIBUTE, self.id)
@@ -880,7 +891,8 @@ type Oriented = {
 	sx: number,
 	sy: number,
 	sz: number,
-	flags: buffer, -- u8, 1 = delete
+	flags: buffer, -- u8, 1 = delete (shatter mode)
+	regions: buffer?, -- u8, 0 = none, 1..n = region (detach mode)
 }
 
 export type FracturePattern = typeof(setmetatable(
@@ -915,7 +927,9 @@ local ROTATIONS: { [Types.Face]: (number, number, number, number, number, number
 }
 
 -- `flags` is u8, 1 = delete, canonical Top facing, laid out like Grid.offset.
-function FracturePattern.new(sx: number, sy: number, sz: number, flags: buffer): FracturePattern
+-- `regions` (optional, same layout) is the compact region map that enables
+-- detach mode: 0 = no region, 1..n = region id.
+function FracturePattern.new(sx: number, sy: number, sz: number, flags: buffer, regions: buffer?): FracturePattern
 	assert(buffer.len(flags) == sx * sy * sz, "flag buffer does not match dims")
 
 	local oriented = {}
@@ -923,20 +937,26 @@ function FracturePattern.new(sx: number, sy: number, sz: number, flags: buffer):
 	for face, map in ROTATIONS do
 		local _, _, _, nsx, nsy, nsz = map(0, 0, 0, sx, sy, sz)
 		local rotated = buffer.create(nsx * nsy * nsz)
+		local rotatedRegions = if regions then buffer.create(nsx * nsy * nsz) else nil
 		for y = 0, sy - 1 do
 			for z = 0, sz - 1 do
 				for x = 0, sx - 1 do
-					if buffer.readu8(flags, x + z * sx + y * sx * sz) == 1 then
-						local nx, ny, nz = map(x, y, z, sx, sy, sz)
-						buffer.writeu8(rotated, nx + nz * nsx + ny * nsx * nsz, 1)
+					local offset = x + z * sx + y * sx * sz
+					local nx, ny, nz = map(x, y, z, sx, sy, sz)
+					local rotatedOffset = nx + nz * nsx + ny * nsx * nsz
+					if buffer.readu8(flags, offset) == 1 then
+						buffer.writeu8(rotated, rotatedOffset, 1)
 						if face == "Top" then
 							deleteCount += 1
 						end
 					end
+					if regions and rotatedRegions then
+						buffer.writeu8(rotatedRegions, rotatedOffset, buffer.readu8(regions, offset))
+					end
 				end
 			end
 		end
-		oriented[face] = { sx = nsx, sy = nsy, sz = nsz, flags = rotated }
+		oriented[face] = { sx = nsx, sy = nsy, sz = nsz, flags = rotated, regions = rotatedRegions }
 	end
 
 	return setmetatable({
@@ -958,6 +978,39 @@ function FracturePattern.fromFunction(sx: number, sy: number, sz: number, fn: (n
 		end
 	end
 	return FracturePattern.new(sx, sy, sz, flags)
+end
+
+-- DETACH mode: writes the pattern's region labels into a volume-sized u8
+-- label buffer (0 stays "no label"), centred on (cx,cy,cz), oriented for
+-- `face`. No voxels are touched - Topology later treats boundaries between
+-- differing labels as barriers, so the cells come apart whole, losing
+-- nothing. Returns how many solid voxels were labelled (0 = pattern has no
+-- region map or nothing solid under it).
+function FracturePattern.LabelInto(self: FracturePattern, volume: Volume.Volume, labels: buffer, cx: number, cy: number, cz: number, face: Types.Face): number
+	local o = self.oriented[face] or self.oriented.Top
+	local regions = o.regions
+	if not regions then
+		return 0
+	end
+	local offX = cx - o.sx // 2
+	local offY = cy - o.sy // 2
+	local offZ = cz - o.sz // 2
+	local labelled = 0
+	for y = 0, o.sy - 1 do
+		for z = 0, o.sz - 1 do
+			for x = 0, o.sx - 1 do
+				local region = buffer.readu8(regions, x + z * o.sx + y * o.sx * o.sz)
+				if region ~= 0 then
+					local tx, ty, tz = offX + x, offY + y, offZ + z
+					if Grid.inBounds(tx, ty, tz, volume.sx, volume.sy, volume.sz) and volume:Get(tx, ty, tz) ~= 0 then
+						buffer.writeu8(labels, Grid.offset(tx, ty, tz, volume.sx, volume.sz) // 2, region)
+						labelled += 1
+					end
+				end
+			end
+		end
+	end
+	return labelled
 end
 
 -- Deletes the pattern's voxels from `volume`, centred on (cx,cy,cz), oriented
@@ -1537,9 +1590,12 @@ local function step(world: any)
 			end
 			continue
 		end
-		local pattern, removed = Fracture.apply(body.volume, event, rand)
-		if removed > 0 then
+		local pattern, removed, detachLabels = Fracture.apply(body.volume, event, rand)
+		if removed > 0 or detachLabels then
 			Events.OnFracture:Fire(event, pattern)
+			if detachLabels then
+				body._pendingDetach = detachLabels
+			end
 			if event.position then
 				body._lastFracture = { position = event.position, impulse = event.impulse, at = os.clock() }
 			end
@@ -1550,13 +1606,17 @@ local function step(world: any)
 		end
 	end
 
-	-- 2. Dirty volumes -> Topology (islands -> splits). One job per body.
+	-- 2. Dirty volumes (or pending detach labels) -> Topology. Detach passes
+	-- the fracture's region labels as split barriers: nothing was deleted,
+	-- the pieces just come apart.
 	for _, body in world:Bodies() do
-		if body.destroyed or not body.volume.dirty or body._topoInFlight then
+		if body.destroyed or body._topoInFlight or (not body.volume.dirty and not body._pendingDetach) then
 			continue
 		end
 		local volume = body.volume
 		volume:ClearDirty()
+		local detachLabels = body._pendingDetach
+		body._pendingDetach = nil
 		body._topoInFlight = true
 
 		if volume:IsEmpty() then
@@ -1585,7 +1645,7 @@ local function step(world: any)
 			else
 				applySplit(world, body, islands)
 			end
-		end, snap, volume.sx, volume.sy, volume.sz)
+		end, snap, volume.sx, volume.sy, volume.sz, detachLabels)
 	end
 
 	-- 3. Stress budget: anchored bodies flagged since their last check.
@@ -1708,7 +1768,7 @@ local roundRobin = 0
 
 local function runSerial(jobType: string, a: any, b: any, c: any, d: any, e: any, f: any, g: any, h: any, i: any): any
 	if jobType == "topology" then
-		return Topology.islands(a, b, c, d)
+		return Topology.islands(a, b, c, d, e)
 	elseif jobType == "boxer" then
 		return Boxer.decompose(a, b, c, d)
 	elseif jobType == "stress" then
@@ -1807,7 +1867,7 @@ local Stress = require(package._Patterns.Stress)
 actor:BindToMessageParallel("ChunkrJob", function(jobId: number, jobType: string, a, b, c, d, e, f, g, h, i)
 	local result
 	if jobType == "topology" then
-		result = Topology.islands(a, b, c, d)
+		result = Topology.islands(a, b, c, d, e)
 	elseif jobType == "boxer" then
 		result = Boxer.decompose(a, b, c, d)
 	elseif jobType == "stress" then
@@ -8742,20 +8802,36 @@ function Fracture.pick(fractureTable: Types.FractureTable, impulse: number, rand
 	return nil
 end
 
--- Applies a fracture event to a volume. Returns the stamped pattern and how
--- many voxels the cracks removed (0/nil when the material has no table or
--- the impulse reaches no band).
-function Fracture.apply(volume: Volume.Volume, event: Types.FractureEvent, rand: () -> number): (any?, number)
-	local fractureTable = event.material.fractureTable
+-- Applies a fracture event to a volume. Behaviour depends on the material's
+-- breakMode:
+--   shatter - stamps the crack walls as deleted voxels (returns removed > 0)
+--   detach  - deletes NOTHING; returns a volume-sized u8 label buffer whose
+--             regions Topology treats as split barriers, so the pieces come
+--             apart whole
+-- Returns (pattern, removedCount, detachLabels). pattern is nil when the
+-- material has no table or the impulse reaches no band.
+function Fracture.apply(volume: Volume.Volume, event: Types.FractureEvent, rand: () -> number): (any?, number, buffer?)
+	local material = event.material
+	local fractureTable = material.fractureTable
 	if not fractureTable then
-		return nil, 0
+		return nil, 0, nil
 	end
 	local entry = Fracture.pick(fractureTable, event.impulse, rand)
 	if not entry then
-		return nil, 0
+		return nil, 0, nil
 	end
+
+	if material.breakMode == "detach" then
+		local labels = buffer.create(volume:Count())
+		local labelled = entry.pattern:LabelInto(volume, labels, event.x, event.y, event.z, event.face)
+		if labelled == 0 then
+			return nil, 0, nil
+		end
+		return entry.pattern, 0, labels
+	end
+
 	local removed = entry.pattern:Stamp(volume, event.x, event.y, event.z, event.face)
-	return entry.pattern, removed
+	return entry.pattern, removed, nil
 end
 
 return Fracture
@@ -8808,7 +8884,7 @@ function Planes.generate(size: number, options: Options?): FracturePattern.Fract
 		table.insert(planes, { nx = nx, ny = ny, nz = nz, d = nx * px + ny * py + nz * pz })
 	end
 
-	local flags = Regions.flags(size, size, size, function(x, y, z)
+	local built = Regions.build(size, size, size, function(x, y, z)
 		local mask = 0
 		for index, p in planes do
 			if p.nx * x + p.ny * y + p.nz * z > p.d then
@@ -8817,7 +8893,7 @@ function Planes.generate(size: number, options: Options?): FracturePattern.Fract
 		end
 		return mask
 	end)
-	return FracturePattern.new(size, size, size, flags)
+	return FracturePattern.new(size, size, size, built.flags, built.regions)
 end
 
 return Planes
@@ -8867,7 +8943,7 @@ function Radial.generate(size: number, options: Options?): FracturePattern.Fract
 	end
 	table.sort(rings)
 
-	local flags = Regions.flags(size, size, size, function(x, y, z)
+	local built = Regions.build(size, size, size, function(x, y, z)
 		local dx, dz = x - c, z - c
 		local r = math.sqrt(dx * dx + dz * dz)
 		if r > maxR then
@@ -8890,45 +8966,66 @@ function Radial.generate(size: number, options: Options?): FracturePattern.Fract
 		end
 		return sector * 32 + band
 	end)
-	return FracturePattern.new(size, size, size, flags)
+	return FracturePattern.new(size, size, size, built.flags, built.regions)
 end
 
 return Radial
 ]])
 mod("Regions", _13, [[
 --!native
--- Shared cell-boundary crack builder for the stock generators.
+-- Shared cell-region builder for the stock generators.
 --
--- Instead of deleting a distance band around cell boundaries (which must be
--- ~2 voxels thick before it reliably severs, and then erases 30%+ of the
--- material), each voxel is assigned a REGION id and exactly one voxel of
--- wall is deleted between differing regions - only on the lower-id side.
+-- Each voxel gets a REGION id from the generator (nearest Worley seed,
+-- plane-side bitmask, spoke sector x ring band; -1 = outside the pattern).
+-- Two products come out of the same region grid:
 --
--- Why one-sided deletion still guarantees separation: any 6-connected path
--- from region A to region B must step directly from an A voxel to a B
--- voxel; whichever of the pair has the smaller region id was deleted, so
--- the step is impossible. Cracks are exactly 1 voxel thin, the true/false
--- map keeps everything else, and Topology takes it from there.
---
--- region(x, y, z) returns an integer >= 0, or -1 for "outside the pattern"
--- (no crack is drawn against outside).
+--   flags   - boolean crack map for SHATTER mode: exactly one voxel of wall
+--             is deleted between differing regions, only on the lower-id
+--             side. One-sided deletion still guarantees separation: any
+--             6-path from region A to region B must step directly across
+--             the deleted side of the pair.
+--   regions - compact u8 region map (0 = outside/no region, 1..n = region)
+--             for DETACH mode: no voxels are deleted at all; Topology treats
+--             boundaries between differing labels as barriers, so the cells
+--             come apart whole.
 
 local Regions = {}
 
-function Regions.flags(sx: number, sy: number, sz: number, region: (number, number, number) -> number): buffer
+export type Built = {
+	flags: buffer, -- u8, 1 = delete (shatter walls)
+	regions: buffer, -- u8, 0 = none, 1..n = compact region id
+	regionCount: number,
+}
+
+function Regions.build(sx: number, sy: number, sz: number, region: (number, number, number) -> number): Built
 	local total = sx * sy * sz
 	local ids = table.create(total)
+	local compact: { [number]: number } = {}
+	local regionCount = 0
 	local i = 0
 	for y = 0, sy - 1 do
 		for z = 0, sz - 1 do
 			for x = 0, sx - 1 do
 				i += 1
-				ids[i] = region(x, y, z)
+				local raw = region(x, y, z)
+				if raw < 0 then
+					ids[i] = -1
+				else
+					local id = compact[raw]
+					if not id then
+						regionCount += 1
+						assert(regionCount <= 254, "fracture pattern has too many regions (max 254)")
+						compact[raw] = regionCount
+						id = regionCount
+					end
+					ids[i] = id
+				end
 			end
 		end
 	end
 
 	local flags = buffer.create(total)
+	local regions = buffer.create(total)
 	local function idAt(x: number, y: number, z: number): number
 		if x < 0 or y < 0 or z < 0 or x >= sx or y >= sy or z >= sz then
 			return -1
@@ -8943,6 +9040,9 @@ function Regions.flags(sx: number, sy: number, sz: number, region: (number, numb
 				i += 1
 				local mine = ids[i]
 				if mine >= 0 then
+					-- Grid layout must match Grid.offset (x, then z, then y).
+					local offset = x + z * sx + y * sx * sz
+					buffer.writeu8(regions, offset, mine)
 					local function boundary(nx: number, ny: number, nz: number): boolean
 						local theirs = idAt(nx, ny, nz)
 						return theirs >= 0 and theirs > mine
@@ -8952,14 +9052,18 @@ function Regions.flags(sx: number, sy: number, sz: number, region: (number, numb
 						or boundary(x, y - 1, z) or boundary(x, y + 1, z)
 						or boundary(x, y, z - 1) or boundary(x, y, z + 1)
 					then
-						-- Grid layout must match Grid.offset (x, then z, then y).
-						buffer.writeu8(flags, x + z * sx + y * sx * sz, 1)
+						buffer.writeu8(flags, offset, 1)
 					end
 				end
 			end
 		end
 	end
-	return flags
+	return { flags = flags, regions = regions, regionCount = regionCount }
+end
+
+-- Back-compat shim for flag-only callers.
+function Regions.flags(sx: number, sy: number, sz: number, region: (number, number, number) -> number): buffer
+	return Regions.build(sx, sy, sz, region).flags
 end
 
 return Regions
@@ -9043,7 +9147,7 @@ function Worley.generate(size: number, options: Options?): FracturePattern.Fract
 		table.insert(seeds, { x = rand() * size, y = rand() * size, z = rand() * size })
 	end
 
-	local flags = Regions.flags(size, size, size, function(x, y, z)
+	local built = Regions.build(size, size, size, function(x, y, z)
 		local best, bestD = 0, math.huge
 		for index, s in seeds do
 			local dx, dy, dz = x + 0.5 - s.x, y + 0.5 - s.y, z + 0.5 - s.z
@@ -9055,7 +9159,7 @@ function Worley.generate(size: number, options: Options?): FracturePattern.Fract
 		end
 		return best
 	end)
-	return FracturePattern.new(size, size, size, flags)
+	return FracturePattern.new(size, size, size, built.flags, built.regions)
 end
 
 return Worley
@@ -9316,6 +9420,7 @@ function Materials.define(name: string, def: Types.MaterialDef): Types.Material
 		color = def.color,
 		flammability = def.flammability or 0,
 		fractureTable = def.fractureTable,
+		breakMode = def.breakMode or "shatter",
 	}
 	table.insert(byId, material)
 	byName[name] = material
@@ -9554,7 +9659,13 @@ export type Island = {
 
 -- Returns every connected component of the volume. One island means the body
 -- is still whole; the caller keeps it and skips any splitting.
-function Topology.islands(voxels: buffer, sx: number, sy: number, sz: number): { Island }
+--
+-- `labels` (optional, u8 per voxel): detach-mode barriers. Traversal between
+-- two voxels is blocked when BOTH carry non-zero labels that differ - the
+-- fracture pattern's regions come apart whole without deleting anything.
+-- Unlabelled voxels (0) connect freely, so cells at the pattern's edge stay
+-- with the body, mirroring shatter-mode behaviour.
+function Topology.islands(voxels: buffer, sx: number, sy: number, sz: number, labels: buffer?): { Island }
 	local total = sx * sy * sz
 	local visited = buffer.create(total) -- u8 flags
 	local islands: { Island } = {}
@@ -9587,12 +9698,19 @@ function Topology.islands(voxels: buffer, sx: number, sy: number, sz: number): {
 			if z > maxZ then maxZ = z end
 
 			-- 6-neighbours, bounds-checked, push unvisited solids.
+			local myLabel = if labels then buffer.readu8(labels, index) else 0
 			local function try(nx: number, ny: number, nz: number)
 				if nx < 0 or ny < 0 or nz < 0 or nx >= sx or ny >= sy or nz >= sz then
 					return
 				end
 				local ni = nx + nz * sx + ny * sxsz
 				if buffer.readu8(visited, ni) == 0 and buffer.readu16(voxels, ni * 2) ~= 0 then
+					if labels and myLabel ~= 0 then
+						local theirLabel = buffer.readu8(labels, ni)
+						if theirLabel ~= 0 and theirLabel ~= myLabel then
+							return -- detach barrier
+						end
+					end
 					buffer.writeu8(visited, ni, 1)
 					table.insert(stack, ni)
 				end

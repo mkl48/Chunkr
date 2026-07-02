@@ -45,7 +45,7 @@ function Planes.generate(size: number, options: Options?): FracturePattern.Fract
 		table.insert(planes, { nx = nx, ny = ny, nz = nz, d = nx * px + ny * py + nz * pz })
 	end
 
-	local flags = Regions.flags(size, size, size, function(x, y, z)
+	local built = Regions.build(size, size, size, function(x, y, z)
 		local mask = 0
 		for index, p in planes do
 			if p.nx * x + p.ny * y + p.nz * z > p.d then
@@ -54,7 +54,7 @@ function Planes.generate(size: number, options: Options?): FracturePattern.Fract
 		end
 		return mask
 	end)
-	return FracturePattern.new(size, size, size, flags)
+	return FracturePattern.new(size, size, size, built.flags, built.regions)
 end
 
 return Planes

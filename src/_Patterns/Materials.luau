@@ -25,6 +25,7 @@ function Materials.define(name: string, def: Types.MaterialDef): Types.Material
 		color = def.color,
 		flammability = def.flammability or 0,
 		fractureTable = def.fractureTable,
+		breakMode = def.breakMode or "shatter",
 	}
 	table.insert(byId, material)
 	byName[name] = material

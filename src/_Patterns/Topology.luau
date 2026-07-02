@@ -24,7 +24,13 @@ export type Island = {
 
 -- Returns every connected component of the volume. One island means the body
 -- is still whole; the caller keeps it and skips any splitting.
-function Topology.islands(voxels: buffer, sx: number, sy: number, sz: number): { Island }
+--
+-- `labels` (optional, u8 per voxel): detach-mode barriers. Traversal between
+-- two voxels is blocked when BOTH carry non-zero labels that differ - the
+-- fracture pattern's regions come apart whole without deleting anything.
+-- Unlabelled voxels (0) connect freely, so cells at the pattern's edge stay
+-- with the body, mirroring shatter-mode behaviour.
+function Topology.islands(voxels: buffer, sx: number, sy: number, sz: number, labels: buffer?): { Island }
 	local total = sx * sy * sz
 	local visited = buffer.create(total) -- u8 flags
 	local islands: { Island } = {}
@@ -57,12 +63,19 @@ function Topology.islands(voxels: buffer, sx: number, sy: number, sz: number): {
 			if z > maxZ then maxZ = z end
 
 			-- 6-neighbours, bounds-checked, push unvisited solids.
+			local myLabel = if labels then buffer.readu8(labels, index) else 0
 			local function try(nx: number, ny: number, nz: number)
 				if nx < 0 or ny < 0 or nz < 0 or nx >= sx or ny >= sy or nz >= sz then
 					return
 				end
 				local ni = nx + nz * sx + ny * sxsz
 				if buffer.readu8(visited, ni) == 0 and buffer.readu16(voxels, ni * 2) ~= 0 then
+					if labels and myLabel ~= 0 then
+						local theirLabel = buffer.readu8(labels, ni)
+						if theirLabel ~= 0 and theirLabel ~= myLabel then
+							return -- detach barrier
+						end
+					end
 					buffer.writeu8(visited, ni, 1)
 					table.insert(stack, ni)
 				end

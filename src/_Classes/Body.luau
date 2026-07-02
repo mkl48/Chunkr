@@ -62,6 +62,8 @@ export type Body = typeof(setmetatable(
 		_pendingVelocity: Vector3?,
 		-- Most recent fracture, so split fragments scatter from its point.
 		_lastFracture: { position: Vector3, impulse: number, at: number }?,
+		-- Detach-mode fracture labels awaiting a barrier Topology pass.
+		_pendingDetach: buffer?,
 	},
 	Body
 ))
@@ -93,6 +95,7 @@ function Body.fromVolume(volume: Volume.Volume, config: Config?): Body
 		_stressDirty = false,
 		_pendingVelocity = nil,
 		_lastFracture = nil,
+		_pendingDetach = nil,
 	}, Body)
 
 	model:SetAttribute(Body.ID_ATTRIBUTE, self.id)

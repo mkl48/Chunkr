@@ -191,9 +191,12 @@ local function step(world: any)
 			end
 			continue
 		end
-		local pattern, removed = Fracture.apply(body.volume, event, rand)
-		if removed > 0 then
+		local pattern, removed, detachLabels = Fracture.apply(body.volume, event, rand)
+		if removed > 0 or detachLabels then
 			Events.OnFracture:Fire(event, pattern)
+			if detachLabels then
+				body._pendingDetach = detachLabels
+			end
 			if event.position then
 				body._lastFracture = { position = event.position, impulse = event.impulse, at = os.clock() }
 			end
@@ -204,13 +207,17 @@ local function step(world: any)
 		end
 	end
 
-	-- 2. Dirty volumes -> Topology (islands -> splits). One job per body.
+	-- 2. Dirty volumes (or pending detach labels) -> Topology. Detach passes
+	-- the fracture's region labels as split barriers: nothing was deleted,
+	-- the pieces just come apart.
 	for _, body in world:Bodies() do
-		if body.destroyed or not body.volume.dirty or body._topoInFlight then
+		if body.destroyed or body._topoInFlight or (not body.volume.dirty and not body._pendingDetach) then
 			continue
 		end
 		local volume = body.volume
 		volume:ClearDirty()
+		local detachLabels = body._pendingDetach
+		body._pendingDetach = nil
 		body._topoInFlight = true
 
 		if volume:IsEmpty() then
@@ -239,7 +246,7 @@ local function step(world: any)
 			else
 				applySplit(world, body, islands)
 			end
-		end, snap, volume.sx, volume.sy, volume.sz)
+		end, snap, volume.sx, volume.sy, volume.sz, detachLabels)
 	end
 
 	-- 3. Stress budget: anchored bodies flagged since their last check.

@@ -124,6 +124,52 @@ do
 	eq(r2, 0, "steel loses nothing")
 end
 
+-- ------------------------------------------------- detach mode
+do
+	Materials._reset()
+	local plank = Materials.define("Plank", {
+		density = 0.4,
+		strength = 2,
+		toughness = 30,
+		color = 1,
+		breakMode = "detach",
+		fractureTable = Fracture.Stock.wood(30),
+	})
+	eq(plank.breakMode, "detach", "breakMode stored")
+
+	local rand = Grid.rng(7)
+	local block = Volume.new(16, 16, 16)
+	block:FillBox(0, 0, 0, 15, 15, 15, plank.id)
+	local before = block.solidCount
+
+	local pattern, removed, labels = Fracture.apply(block, {
+		kind = "fracture",
+		body = nil,
+		x = 8,
+		y = 15,
+		z = 8,
+		face = "Top",
+		impulse = 100,
+		material = plank,
+	}, rand)
+	eq(pattern ~= nil, true, "detach picked a pattern")
+	eq(removed, 0, "detach deletes nothing")
+	eq(labels ~= nil, true, "detach returns labels")
+	eq(block.solidCount, before, "volume untouched")
+
+	-- Barrier topology: pieces come apart whole, zero voxels lost.
+	local islands = Topology.islands(block.voxels, 16, 16, 16, labels)
+	eq(#islands >= 2, true, `detach separates pieces (got {#islands})`)
+	local total = 0
+	for _, island in islands do
+		total += island.count
+	end
+	eq(total, before, "every voxel conserved across detach")
+
+	-- Without labels the same volume is still one island (nothing deleted).
+	eq(#Topology.islands(block.voxels, 16, 16, 16), 1, "volume itself is whole")
+end
+
 -- ------------------------------------------------- damage accumulation
 do
 	local store = Damage.newStore()

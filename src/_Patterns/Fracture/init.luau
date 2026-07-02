@@ -49,20 +49,36 @@ function Fracture.pick(fractureTable: Types.FractureTable, impulse: number, rand
 	return nil
 end
 
--- Applies a fracture event to a volume. Returns the stamped pattern and how
--- many voxels the cracks removed (0/nil when the material has no table or
--- the impulse reaches no band).
-function Fracture.apply(volume: Volume.Volume, event: Types.FractureEvent, rand: () -> number): (any?, number)
-	local fractureTable = event.material.fractureTable
+-- Applies a fracture event to a volume. Behaviour depends on the material's
+-- breakMode:
+--   shatter - stamps the crack walls as deleted voxels (returns removed > 0)
+--   detach  - deletes NOTHING; returns a volume-sized u8 label buffer whose
+--             regions Topology treats as split barriers, so the pieces come
+--             apart whole
+-- Returns (pattern, removedCount, detachLabels). pattern is nil when the
+-- material has no table or the impulse reaches no band.
+function Fracture.apply(volume: Volume.Volume, event: Types.FractureEvent, rand: () -> number): (any?, number, buffer?)
+	local material = event.material
+	local fractureTable = material.fractureTable
 	if not fractureTable then
-		return nil, 0
+		return nil, 0, nil
 	end
 	local entry = Fracture.pick(fractureTable, event.impulse, rand)
 	if not entry then
-		return nil, 0
+		return nil, 0, nil
 	end
+
+	if material.breakMode == "detach" then
+		local labels = buffer.create(volume:Count())
+		local labelled = entry.pattern:LabelInto(volume, labels, event.x, event.y, event.z, event.face)
+		if labelled == 0 then
+			return nil, 0, nil
+		end
+		return entry.pattern, 0, labels
+	end
+
 	local removed = entry.pattern:Stamp(volume, event.x, event.y, event.z, event.face)
-	return entry.pattern, removed
+	return entry.pattern, removed, nil
 end
 
 return Fracture
