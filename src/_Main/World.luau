@@ -8,6 +8,8 @@ local Blueprint = require(script.Parent.Parent._Classes.Blueprint)
 local Materials = require(script.Parent.Parent._Patterns.Materials)
 local Fracture = require(script.Parent.Parent._Patterns.Fracture)
 local Impact = require(script.Parent.Parent._Patterns.Impact)
+local Adopt = require(script.Parent.Parent._Patterns.Adopt)
+local Bin = require(script.Parent.Parent._Utility.Bin)
 local Raycast = require(script.Parent.Parent._Utility.Raycast)
 local Query = require(script.Parent.Parent._Utility.Query)
 local Grid = require(script.Parent.Parent._Utility.Grid)
@@ -50,6 +52,12 @@ function World.Bodies(self: World): { [number]: Body.Body }
 	return self.bodies
 end
 
+-- Manually voxelize a regular part into a Body (destruction ops do this
+-- automatically for parts they touch). Returns nil if ineligible/too large.
+function World.Adopt(self: World, part: BasePart): Body.Body?
+	return Adopt.part(self, part)
+end
+
 -- Conservative world-space bounding sphere for quick rejection.
 local function boundingSphere(body: Body.Body): (Vector3, number)
 	local extents = Vector3.new(body.volume.sx, body.volume.sy, body.volume.sz) * body.voxelSize
@@ -60,6 +68,7 @@ end
 -- ---------------------------------------------------------------- carve ops
 
 function World.CarveSphere(self: World, position: Vector3, radiusStuds: number, power: number?): number
+	Adopt.sweepRadius(self, position, radiusStuds)
 	local removed = 0
 	for _, body in self.bodies do
 		local center, radius = boundingSphere(body)
@@ -109,6 +118,7 @@ local function fractureRim(self: World, body: any, position: Vector3, radiusStud
 end
 
 function World.Explode(self: World, position: Vector3, radiusStuds: number, power: number): number
+	Adopt.sweepRadius(self, position, radiusStuds)
 	local removed = 0
 	for _, body in self.bodies do
 		local center, radius = boundingSphere(body)
@@ -139,6 +149,14 @@ function World.Explode(self: World, position: Vector3, radiusStuds: number, powe
 end
 
 function World.CutRay(self: World, origin: Vector3, target: Vector3, thicknessStuds: number, power: number?): number
+	local length = (target - origin).Magnitude
+	if length > 1e-3 then
+		Adopt.sweepBox(
+			self,
+			CFrame.lookAt((origin + target) / 2, target),
+			Vector3.new(thicknessStuds * 2, thicknessStuds * 2, length + thicknessStuds * 2)
+		)
+	end
 	local removed = 0
 	local mid = (origin + target) / 2
 	local reach = (target - origin).Magnitude / 2 + thicknessStuds
@@ -154,17 +172,64 @@ end
 -- Hitscan: raycast + route the hit through the same fracture/dent/fatigue
 -- decision as a physical contact. `impulse` is the projectile's punch in the
 -- same N·s scale as contact impulses - weapons pick a number per calibre.
--- Fires OnImpact; Simulation applies the queued consequence next tick.
--- Returns the hit (nil on miss).
+-- Regular map parts in the line of fire are adopted on the spot (the shot
+-- that would hit a plain wall voxelizes it, then damages it). Fires
+-- OnImpact; Simulation applies the queued consequence next tick. Returns
+-- the hit (nil on miss or when blocked by something unadoptable).
 function World.Hit(self: World, origin: Vector3, direction: Vector3, maxDistance: number, impulse: number): Types.RaycastHit?
-	local hit = self:Raycast(origin, direction, maxDistance)
+	local unit = direction.Unit
+	local hit = self:Raycast(origin, unit, maxDistance)
+
+	-- Check whether a regular part sits in front of the voxel hit.
+	if self.config.adopt.enabled then
+		local params = RaycastParams.new()
+		local exclude: { Instance } = {}
+		local rootFolder = Bin.rootFolder()
+		if rootFolder then
+			table.insert(exclude, rootFolder)
+		end
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = exclude
+		local wsHit = workspace:Raycast(origin, unit * maxDistance, params)
+		-- Chunkr parts outside _Bin (custom-parented bodies) belong to the
+		-- voxel raycast's side of the fence, not adoption's.
+		if wsHit and wsHit.Instance:GetAttribute(Body.ID_ATTRIBUTE) ~= nil then
+			wsHit = nil
+		end
+		if wsHit and wsHit.Instance and (not hit or wsHit.Distance < hit.distance) then
+			local adopted = Adopt.part(self, wsHit.Instance)
+			if adopted then
+				-- Damage the freshly voxelized body at the impact point.
+				Events.OnImpact:Fire(adopted, nil, wsHit.Position, wsHit.Normal, impulse)
+				Impact.resolve(self.config, adopted, wsHit.Position, unit, impulse)
+				local lx, ly, lz = adopted:WorldToLocal(wsHit.Position - unit * (adopted.voxelSize / 2))
+				local x = math.clamp(math.floor(lx), 0, adopted.volume.sx - 1)
+				local y = math.clamp(math.floor(ly), 0, adopted.volume.sy - 1)
+				local z = math.clamp(math.floor(lz), 0, adopted.volume.sz - 1)
+				local nx, ny, nz = adopted:WorldToLocalDirection(wsHit.Normal)
+				return {
+					body = adopted,
+					x = x,
+					y = y,
+					z = z,
+					material = Materials.byId(adopted.volume:GetSafe(x, y, z)) or Materials.byId(adopted.volume:Get(0, 0, 0)),
+					face = Grid.dominantFace(nx, ny, nz) :: Types.Face,
+					position = wsHit.Position,
+					distance = wsHit.Distance,
+				}
+			end
+			-- Unadoptable blocker (character, ignored part): the shot stops.
+			return nil
+		end
+	end
+
 	if not hit then
 		return nil
 	end
 	local body = hit.body
-	Events.OnImpact:Fire(body, nil, hit.position, -direction.Unit, impulse)
+	Events.OnImpact:Fire(body, nil, hit.position, -unit, impulse)
 	if body.carvable then
-		Impact.resolve(self.config, body, hit.position, direction.Unit, impulse)
+		Impact.resolve(self.config, body, hit.position, unit, impulse)
 	end
 	return hit
 end

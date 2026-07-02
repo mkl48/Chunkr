@@ -36,6 +36,11 @@ function Materials.get(name: string): Types.Material
 	return assert(byName[name], `unknown material "{name}"`)
 end
 
+-- Nil-safe lookup (adoption caches auto-defined materials by name).
+function Materials.find(name: string): Types.Material?
+	return byName[name]
+end
+
 -- id 0 (air) returns nil.
 function Materials.byId(id: number): Types.Material?
 	return byId[id]

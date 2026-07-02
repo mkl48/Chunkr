@@ -60,6 +60,19 @@ local Config = {
 		rimMinVoxels = 600,
 	},
 
+	-- Adoption: regular BaseParts hit by destruction ops get voxelized into
+	-- Chunkr bodies on the fly (VoxBreaker-style), so plain-Part maps are
+	-- destructible with zero setup. Opt-out per part: ChunkrIgnore attribute.
+	-- Per-part overrides: ChunkrMaterial (name), ChunkrVoxelSize (studs).
+	adopt = {
+		enabled = true,
+		voxelSize = 1, -- studs per voxel for adopted parts
+		-- Big parts auto-coarsen their voxel size to stay under maxVoxels
+		-- (a 512-stud baseplate becomes ~4-stud voxels instead of a million).
+		maxVoxels = 150000,
+		maxAutoVoxelSize = 8,
+	},
+
 	-- Networking
 	net = {
 		maxOpsPerPlayerPerSecond = 30,

@@ -60,4 +60,9 @@ function Bin.isBin(instance: Instance?): boolean
 	return instance ~= nil and root ~= nil and (instance == root or instance.Parent == root)
 end
 
+-- The _Bin root if it exists (spatial queries exclude it without creating it).
+function Bin.rootFolder(): Folder?
+	return if root and root.Parent then root else nil
+end
+
 return Bin

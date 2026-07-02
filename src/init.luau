@@ -116,6 +116,13 @@ function Chunkr.FromVox(self: Chunkr, data: buffer, map: (number, { { number } }
 	return self.world:Add(body)
 end
 
+-- Voxelize a regular BasePart into a destructible body right now. The
+-- destruction ops (CarveSphere/Explode/CutRay/Hit) adopt intersecting map
+-- parts automatically when config.adopt.enabled - this is the manual hook.
+function Chunkr.Adopt(self: Chunkr, part: BasePart): Body.Body?
+	return self.world:Adopt(part)
+end
+
 -- Call after authoring a body's voxels to build its Parts.
 function Chunkr.Commit(self: Chunkr, body: Body.Body)
 	body.volume:ClearDirty()
