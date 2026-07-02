@@ -260,6 +260,12 @@ export type MaterialDef = {
 	toughness: number,
 	-- Render colour (Color3 in Roblox; opaque to the pure layer).
 	color: any,
+	-- Render appearance applied to every Part of every body (and fragment)
+	-- of this material, re-applied on every rebuild - set these instead of
+	-- editing parts by hand (rebuilds recreate parts and wipe manual edits).
+	renderMaterial: any?, -- Enum.Material; default Plastic
+	transparency: number?, -- default 0
+	reflectance: number?, -- default 0
 	-- Reserved for fire propagation (v2). 0 = inert.
 	flammability: number?,
 	-- Crack patterns picked by impulse band + randomness. nil = never fractures
@@ -281,6 +287,9 @@ export type Material = {
 	strength: number,
 	toughness: number,
 	color: any,
+	renderMaterial: any?,
+	transparency: number,
+	reflectance: number,
 	flammability: number,
 	fractureTable: FractureTable?,
 	breakMode: BreakMode,
@@ -812,6 +821,9 @@ function Body.ApplyBoxes(self: Body, boxes: { Types.Box })
 		part.Anchored = self.anchored
 		if material then
 			part.Color = material.color
+			part.Material = material.renderMaterial or Enum.Material.Plastic
+			part.Transparency = material.transparency
+			part.Reflectance = material.reflectance
 			part.CustomPhysicalProperties = PhysicalProperties.new(material.density, 0.5, 0.2)
 		end
 		part:SetAttribute(Body.ID_ATTRIBUTE, self.id)
@@ -850,6 +862,11 @@ function Body.ApplyBoxes(self: Body, boxes: { Types.Box })
 			root.AssemblyAngularVelocity = angVel
 		end
 	end
+
+	-- Post-styling hook: fires after EVERY rebuild, so per-part customisation
+	-- beyond material appearance (textures, decals, attributes) survives
+	-- remeshing - do it in this event, not in a one-shot loop.
+	Events.OnBodyRebuilt:Fire(self)
 end
 
 -- ---------------------------------------------------------------- physics
@@ -8586,6 +8603,10 @@ local function resolveMaterial(part: BasePart): Types.Material
 		strength = preset.strength,
 		toughness = preset.toughness,
 		color = part.Color,
+		-- Keep the part's look: adopted glass still renders as Glass.
+		renderMaterial = part.Material,
+		transparency = part.Transparency,
+		reflectance = part.Reflectance,
 		breakMode = preset.breakMode,
 		fractureTable = buildTable(preset.archetype, preset.toughness),
 	})
@@ -9696,6 +9717,9 @@ function Materials.define(name: string, def: Types.MaterialDef): Types.Material
 		strength = def.strength,
 		toughness = def.toughness,
 		color = def.color,
+		renderMaterial = def.renderMaterial,
+		transparency = def.transparency or 0,
+		reflectance = def.reflectance or 0,
 		flammability = def.flammability or 0,
 		fractureTable = def.fractureTable,
 		breakMode = def.breakMode or "shatter",
@@ -10214,6 +10238,9 @@ local Events = {
 	-- (body) lifecycle
 	OnBodyAdded = Signal.new(),
 	OnBodyRemoved = Signal.new(),
+	-- (body) after its Parts are (re)built. Rebuilds recreate Parts, so any
+	-- per-part styling beyond the material's appearance fields belongs here.
+	OnBodyRebuilt = Signal.new(),
 	-- Client only: replicated FX payloads from the server's event stream
 	-- ({ t = "carve"|"fracture"|"crumble"|"split", p = Vector3, ... }).
 	OnFx = Signal.new(),

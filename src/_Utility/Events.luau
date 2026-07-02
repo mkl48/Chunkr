@@ -21,6 +21,9 @@ local Events = {
 	-- (body) lifecycle
 	OnBodyAdded = Signal.new(),
 	OnBodyRemoved = Signal.new(),
+	-- (body) after its Parts are (re)built. Rebuilds recreate Parts, so any
+	-- per-part styling beyond the material's appearance fields belongs here.
+	OnBodyRebuilt = Signal.new(),
 	-- Client only: replicated FX payloads from the server's event stream
 	-- ({ t = "carve"|"fracture"|"crumble"|"split", p = Vector3, ... }).
 	OnFx = Signal.new(),

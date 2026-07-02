@@ -261,6 +261,9 @@ function Body.ApplyBoxes(self: Body, boxes: { Types.Box })
 		part.Anchored = self.anchored
 		if material then
 			part.Color = material.color
+			part.Material = material.renderMaterial or Enum.Material.Plastic
+			part.Transparency = material.transparency
+			part.Reflectance = material.reflectance
 			part.CustomPhysicalProperties = PhysicalProperties.new(material.density, 0.5, 0.2)
 		end
 		part:SetAttribute(Body.ID_ATTRIBUTE, self.id)
@@ -299,6 +302,11 @@ function Body.ApplyBoxes(self: Body, boxes: { Types.Box })
 			root.AssemblyAngularVelocity = angVel
 		end
 	end
+
+	-- Post-styling hook: fires after EVERY rebuild, so per-part customisation
+	-- beyond material appearance (textures, decals, attributes) survives
+	-- remeshing - do it in this event, not in a one-shot loop.
+	Events.OnBodyRebuilt:Fire(self)
 end
 
 -- ---------------------------------------------------------------- physics

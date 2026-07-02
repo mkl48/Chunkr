@@ -90,6 +90,10 @@ local function resolveMaterial(part: BasePart): Types.Material
 		strength = preset.strength,
 		toughness = preset.toughness,
 		color = part.Color,
+		-- Keep the part's look: adopted glass still renders as Glass.
+		renderMaterial = part.Material,
+		transparency = part.Transparency,
+		reflectance = part.Reflectance,
 		breakMode = preset.breakMode,
 		fractureTable = buildTable(preset.archetype, preset.toughness),
 	})

@@ -29,6 +29,9 @@ Chunkr.Materials.define("Glass", {
 	strength = 1,
 	toughness = 8,
 	color = Color3.fromRGB(205, 232, 240),
+	renderMaterial = Enum.Material.Glass,
+	transparency = 0.4,
+	reflectance = 0.05,
 	fractureTable = Chunkr.Fracture.Stock.glass(8),
 })
 Chunkr.Materials.define("Ceramic", {

@@ -17,6 +17,12 @@ export type MaterialDef = {
 	toughness: number,
 	-- Render colour (Color3 in Roblox; opaque to the pure layer).
 	color: any,
+	-- Render appearance applied to every Part of every body (and fragment)
+	-- of this material, re-applied on every rebuild - set these instead of
+	-- editing parts by hand (rebuilds recreate parts and wipe manual edits).
+	renderMaterial: any?, -- Enum.Material; default Plastic
+	transparency: number?, -- default 0
+	reflectance: number?, -- default 0
 	-- Reserved for fire propagation (v2). 0 = inert.
 	flammability: number?,
 	-- Crack patterns picked by impulse band + randomness. nil = never fractures
@@ -38,6 +44,9 @@ export type Material = {
 	strength: number,
 	toughness: number,
 	color: any,
+	renderMaterial: any?,
+	transparency: number,
+	reflectance: number,
 	flammability: number,
 	fractureTable: FractureTable?,
 	breakMode: BreakMode,
