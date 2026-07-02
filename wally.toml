@@ -1,0 +1,10 @@
+[package]
+name = "kr3ative/chunkr"
+version = "0.1.0"
+description = "A voxel engine for Roblox"
+license = "MIT"
+authors = ["kr3ative"]
+registry = "https://github.com/UpliftGames/wally-index"
+realm = "shared"
+
+[dependencies]

@@ -1,0 +1,16 @@
+{
+	"name": "ChunkrPlace",
+	"tree": {
+		"$className": "DataModel",
+		"ReplicatedStorage": {
+			"Chunkr": {
+				"$path": "src"
+			}
+		},
+		"Workspace": {
+			"$properties": {
+				"FilteringEnabled": true
+			}
+		}
+	}
+}
