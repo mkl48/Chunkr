@@ -11,6 +11,11 @@
 			"$properties": {
 				"FilteringEnabled": true
 			}
+		},
+		"ServerScriptService": {
+			"Examples": {
+				"$path": "examples"
+			}
 		}
 	}
 }
