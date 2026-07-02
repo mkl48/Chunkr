@@ -31,6 +31,7 @@ local Anchor = require(script._Classes.Anchor)
 local FracturePattern = require(script._Classes.FracturePattern)
 local Materials = require(script._Patterns.Materials)
 local Fracture = require(script._Patterns.Fracture)
+local Splinter = require(script._Patterns.Splinter)
 local World = require(script._Main.World)
 local Server = require(script._Main.Server)
 local Client = require(script._Main.Client)
@@ -42,6 +43,10 @@ Chunkr.__index = Chunkr
 
 -- Submodules / authoring surface.
 Chunkr.Bin = Bin
+-- The basic voxel converter (VoxBreaker-style): subdivides real Parts into
+-- smaller real Parts inside a hit region, with reset timers. No voxel data,
+-- no materials - the lightweight sibling of adoption.
+Chunkr.Splinter = Splinter
 Chunkr.Materials = Materials
 Chunkr.Fracture = Fracture
 Chunkr.FracturePattern = FracturePattern

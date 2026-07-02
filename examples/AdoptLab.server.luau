@@ -14,6 +14,10 @@
 --                         second it's converted via world:Adopt(part) with
 --                         NO damage - watch it keep sliding, then get cut
 --                         in half mid-slide
+--   D  splinter punch     Chunkr.Splinter (the basic converter, VoxBreaker
+--                         style): a ball hitbox subdivides a plain wall into
+--                         real Parts, flings the voxels inside the region,
+--                         and the wall RESTORES itself 8 seconds later
 --
 -- The floor is ChunkrIgnore'd so the focus stays on the rigids.
 -- Only one Chunkr example script ships Enabled at a time.
@@ -120,8 +124,37 @@ local function pureConversion()
 	world:CutRay(Vector3.new(-20, 2.5, 30), Vector3.new(-20, 2.5, 50), 0.4)
 end
 
+-- D: Splinter - real-Part subdivision with reset, no voxel data at all.
+-- The wall is punched, restores itself via Splinter's reset, and gets
+-- punched again next cycle (found by name after restoration).
+local function splinterPunch()
+	print("[D] splinter punch: ball hitbox into a plain wall, resets in 8s")
+	local wall = workspace:FindFirstChild("SplinterWall")
+	if not wall then
+		wall = rigid(Vector3.new(24, 12, 2), Vector3.new(45, 6, 40), Enum.Material.Brick, Color3.fromRGB(155, 78, 62))
+		wall.Name = "SplinterWall"
+		wall.Anchored = true
+	end
+
+	task.wait(1)
+	local punchAt = wall.Position + Vector3.new(math.random(-6, 6), math.random(-3, 3), 0)
+	local voxels = Chunkr.Splinter.hitbox({
+		shape = "Ball",
+		cframe = CFrame.new(punchAt),
+		size = Vector3.new(7, 7, 7),
+		minimumVoxelSize = 1,
+		timeToReset = 8,
+		unanchor = true,
+	})
+	print(`  -> {#voxels} voxels punched out`)
+	-- Fling them away from the punch.
+	for _, voxel in voxels do
+		voxel.AssemblyLinearVelocity = (voxel.Position - punchAt).Unit * 25 + Vector3.new(0, 12, 0)
+	end
+end
+
 task.wait(2)
-print("[adoptlab] plain rigids -> voxel rigids. A: mid-air | B: stack blast | C: pure conversion")
+print("[adoptlab] plain rigids -> voxel rigids. A: mid-air | B: stack blast | C: pure conversion | D: splinter punch")
 while true do
 	midAirAdoption()
 	task.wait(9)
@@ -129,4 +162,6 @@ while true do
 	task.wait(10)
 	pureConversion()
 	task.wait(9)
+	splinterPunch()
+	task.wait(10)
 end
