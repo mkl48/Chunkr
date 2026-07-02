@@ -164,9 +164,14 @@ function Adopt.part(world: any, part: BasePart): Body.Body?
 
 	local size = part.Size
 	local voxelSize = tonumber(part:GetAttribute("ChunkrVoxelSize")) or cfg.voxelSize
-	local estimate = (size.X * size.Y * size.Z) / (voxelSize ^ 3)
+	local studsVolume = size.X * size.Y * size.Z
+	local estimate = studsVolume / (voxelSize ^ 3)
 	if estimate > cfg.maxVoxels then
-		voxelSize = math.min((size.X * size.Y * size.Z / cfg.maxVoxels) ^ (1 / 3), cfg.maxAutoVoxelSize)
+		-- Huge parts coarsen to stay affordable.
+		voxelSize = math.min((studsVolume / cfg.maxVoxels) ^ (1 / 3), cfg.maxAutoVoxelSize)
+	elseif estimate < cfg.minVoxels and not part:GetAttribute("ChunkrVoxelSize") then
+		-- Small parts refine so they have enough voxels to break well.
+		voxelSize = math.max((studsVolume / cfg.minVoxels) ^ (1 / 3), cfg.minAutoVoxelSize)
 	end
 
 	local sx = math.max(1, math.round(size.X / voxelSize))

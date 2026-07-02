@@ -71,6 +71,11 @@ local Config = {
 		-- (a 512-stud baseplate becomes ~4-stud voxels instead of a million).
 		maxVoxels = 150000,
 		maxAutoVoxelSize = 8,
+		-- ...and SMALL parts auto-refine so they have enough voxels to break
+		-- interestingly (a 4-stud ball at 1 stud/voxel is ~33 voxels - two
+		-- blobs; refined to ~0.4 it's ~500 and shatters properly).
+		minVoxels = 500,
+		minAutoVoxelSize = 0.25,
 		-- Destructible-map healing: destroyed originals return after this
 		-- many seconds (their voxel body is removed; loose fragments remain
 		-- as debris). 0 = never respawn. Per-part ChunkrRespawn overrides.

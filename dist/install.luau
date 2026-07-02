@@ -8684,9 +8684,14 @@ function Adopt.part(world: any, part: BasePart): Body.Body?
 
 	local size = part.Size
 	local voxelSize = tonumber(part:GetAttribute("ChunkrVoxelSize")) or cfg.voxelSize
-	local estimate = (size.X * size.Y * size.Z) / (voxelSize ^ 3)
+	local studsVolume = size.X * size.Y * size.Z
+	local estimate = studsVolume / (voxelSize ^ 3)
 	if estimate > cfg.maxVoxels then
-		voxelSize = math.min((size.X * size.Y * size.Z / cfg.maxVoxels) ^ (1 / 3), cfg.maxAutoVoxelSize)
+		-- Huge parts coarsen to stay affordable.
+		voxelSize = math.min((studsVolume / cfg.maxVoxels) ^ (1 / 3), cfg.maxAutoVoxelSize)
+	elseif estimate < cfg.minVoxels and not part:GetAttribute("ChunkrVoxelSize") then
+		-- Small parts refine so they have enough voxels to break well.
+		voxelSize = math.max((studsVolume / cfg.minVoxels) ^ (1 / 3), cfg.minAutoVoxelSize)
 	end
 
 	local sx = math.max(1, math.round(size.X / voxelSize))
@@ -10285,6 +10290,11 @@ local Config = {
 		-- (a 512-stud baseplate becomes ~4-stud voxels instead of a million).
 		maxVoxels = 150000,
 		maxAutoVoxelSize = 8,
+		-- ...and SMALL parts auto-refine so they have enough voxels to break
+		-- interestingly (a 4-stud ball at 1 stud/voxel is ~33 voxels - two
+		-- blobs; refined to ~0.4 it's ~500 and shatters properly).
+		minVoxels = 500,
+		minAutoVoxelSize = 0.25,
 		-- Destructible-map healing: destroyed originals return after this
 		-- many seconds (their voxel body is removed; loose fragments remain
 		-- as debris). 0 = never respawn. Per-part ChunkrRespawn overrides.
