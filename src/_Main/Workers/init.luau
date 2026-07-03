@@ -18,17 +18,17 @@ local Workers = {}
 local parallel = false
 local actors: { Actor } = {}
 local reply: BindableEvent? = nil
-local pending: { [number]: (any) -> () } = {}
+local pending: { [number]: (...any) -> () } = {}
 local nextJobId = 0
 local roundRobin = 0
 
-local function runSerial(jobType: string, a: any, b: any, c: any, d: any, e: any, f: any, g: any, h: any, i: any): any
+local function runSerial(jobType: string, a: any, b: any, c: any, d: any, e: any, f: any, g: any, h: any, i: any, j: any): ...any
 	if jobType == "topology" then
 		return Topology.islands(a, b, c, d, e)
 	elseif jobType == "boxer" then
 		return Boxer.decompose(a, b, c, d)
 	elseif jobType == "stress" then
-		return Stress.unsupported(a, b, c, d, e, f, g, h, i)
+		return Stress.unsupported(a, b, c, d, e, f, g, h, i, j)
 	end
 	error(`unknown job type {jobType}`)
 end
@@ -45,11 +45,11 @@ function Workers.start(config: any)
 	reply = Instance.new("BindableEvent")
 	reply.Name = "Reply"
 	reply.Parent = folder
-	reply.Event:Connect(function(jobId: number, result: any)
+	reply.Event:Connect(function(jobId: number, ...: any)
 		local callback = pending[jobId]
 		if callback then
 			pending[jobId] = nil
-			callback(result)
+			callback(...)
 		end
 	end)
 
@@ -78,9 +78,10 @@ function Workers.start(config: any)
 	folder.Parent = ServerScriptService
 end
 
--- Dispatches a job; callback runs on the main thread with the result.
+-- Dispatches a job; callback runs on the main thread with the result(s) -
+-- multi-return jobs (stress: broken, warnings) pass through both paths.
 -- Serial mode computes inline (callback still async-shaped for callers).
-function Workers.dispatch(jobType: string, callback: (any) -> (), ...: any)
+function Workers.dispatch(jobType: string, callback: (...any) -> (), ...: any)
 	if not parallel or #actors == 0 then
 		callback(runSerial(jobType, ...))
 		return

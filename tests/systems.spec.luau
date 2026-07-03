@@ -95,6 +95,24 @@ do
 	local spanOnly = Stress.unsupported(tower2.voxels, 1, 30, 1, { 0 }, { [3] = 1 }, 8)
 	eq(#spanOnly, 0, "crush pass optional")
 
+	-- Groans: a shelf JUST inside capacity holds but creaks (warnRatio 0.7),
+	-- severity in (0.7, 1]. capacity 2*4=8; x=3 costs 6 -> 0.75.
+	local groanBeam = Volume.new(4, 1, 1)
+	groanBeam:FillBox(0, 0, 0, 3, 0, 0, 2)
+	local groanBroken, groans = Stress.unsupported(groanBeam.voxels, 4, 1, 1, { 0 }, { [2] = 2 }, 4, nil, nil, 0.7)
+	eq(#groanBroken, 0, "near-capacity shelf holds")
+	eq(#groans > 0, true, "near-capacity shelf creaks")
+	for _, warning in groans do
+		eq(warning.severity > 0.7 and warning.severity <= 1, true, "creak severity in (warnRatio, 1]")
+	end
+
+	-- A comfortable structure stays silent.
+	local quiet = Volume.new(2, 2, 1)
+	quiet:FillBox(0, 0, 0, 1, 1, 0, 2)
+	local quietBroken, quietGroans = Stress.unsupported(quiet.voxels, 2, 2, 1, { 0, 1 }, { [2] = 2 }, 4, nil, nil, 0.7)
+	eq(#quietBroken, 0, "comfortable structure holds")
+	eq(#quietGroans, 0, "comfortable structure is silent")
+
 	-- Hanging costs double: a chain dangling below its seed breaks at half
 	-- the cantilever length. Seed at the TOP (y=4), capacity 3 -> one step
 	-- down costs 2, two steps cost 4 > 3 -> lowest 3 of 5 break.

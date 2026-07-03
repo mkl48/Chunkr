@@ -28,10 +28,12 @@ local Volume = require(script._Classes.Volume)
 local Body = require(script._Classes.Body)
 local Blueprint = require(script._Classes.Blueprint)
 local Anchor = require(script._Classes.Anchor)
+local Joint = require(script._Classes.Joint)
 local FracturePattern = require(script._Classes.FracturePattern)
 local Materials = require(script._Patterns.Materials)
 local Fracture = require(script._Patterns.Fracture)
 local Splinter = require(script._Patterns.Splinter)
+local Persist = require(script._Utility.Persist)
 local World = require(script._Main.World)
 local Server = require(script._Main.Server)
 local Client = require(script._Main.Client)
@@ -52,9 +54,15 @@ Chunkr.Fracture = Fracture
 Chunkr.FracturePattern = FracturePattern
 Chunkr.Blueprint = Blueprint
 Chunkr.Anchor = Anchor
+-- Constraints between voxel positions that survive rebuilds/splits and
+-- break when their host voxel dies (hinged doors, hanging signs, bolts).
+Chunkr.Joint = Joint
 Chunkr.Volume = Volume
 Chunkr.Vox = Vox
 Chunkr.Events = Events
+-- Snapshot <-> DataStore codec (world:Save/Load are the easy path; this is
+-- the raw encode/decode/store surface for custom backends).
+Chunkr.Persist = Persist
 
 export type Material = Types.Material
 export type FractureTable = Types.FractureTable
@@ -151,6 +159,13 @@ function Chunkr.CutRay(self: Chunkr, origin: Vector3, target: Vector3, thickness
 	return self.world:CutRay(origin, target, thicknessStuds, power)
 end
 
+-- Lights every flammable voxel in the sphere (plain parts in reach are
+-- adopted first). Fire spreads by material flammability, then burnt voxels
+-- delete - collapse follows naturally. Explosions also auto-ignite.
+function Chunkr.Ignite(self: Chunkr, position: Vector3, radiusStuds: number): number
+	return self.world:Ignite(position, radiusStuds)
+end
+
 function Chunkr.Raycast(self: Chunkr, origin: Vector3, direction: Vector3, maxDistance: number): Types.RaycastHit?
 	return self.world:Raycast(origin, direction, maxDistance)
 end
@@ -171,6 +186,31 @@ end
 
 function Chunkr.Reset(self: Chunkr, snapshot: World.Snapshot, parent: Instance?)
 	self.world:Reset(snapshot, parent)
+end
+
+-- ---------------------------------------------------------------- building
+
+-- Stamps a solid box of `materialName` centred on `at`. Merges into an
+-- existing aligned body when the box fits inside one; otherwise a new
+-- anchored body spawns.
+function Chunkr.Build(self: Chunkr, at: CFrame | Vector3, sizeStuds: Vector3, materialName: string, voxelSize: number?): Body.Body?
+	local cframe = if typeof(at) == "CFrame" then at else CFrame.new(at :: Vector3)
+	return self.world:Build(cframe, sizeStuds, materialName, voxelSize)
+end
+
+-- Stamps a Blueprint as a fresh body (prefab placement).
+function Chunkr.Place(self: Chunkr, blueprint: Blueprint.Blueprint, cframe: CFrame, anchored: boolean?): Body.Body
+	return self.world:Place(blueprint, cframe, anchored)
+end
+
+-- Chunked DataStore persistence (yields). Store defaults to a DataStore
+-- named config.persist.dataStore; inject { read, write } for custom backends.
+function Chunkr.Save(self: Chunkr, key: string, store: Persist.Store?): number
+	return self.world:Save(key, store)
+end
+
+function Chunkr.Load(self: Chunkr, key: string, store: Persist.Store?, parent: Instance?): boolean
+	return self.world:Load(key, store, parent)
 end
 
 -- ---------------------------------------------------------------- lifecycle

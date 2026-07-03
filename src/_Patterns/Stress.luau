@@ -26,8 +26,12 @@ local Stress = {}
 
 local UNREACHED = 0xFFFF
 
+export type Warning = { index: number, severity: number }
+
 -- `seeds`: 0-based flat indices of grounded voxels. Returns 0-based indices
--- of voxels that fail by span or by crush.
+-- of voxels that fail by span or by crush, plus WARNINGS: voxels loaded past
+-- warnRatio of their capacity but not yet failing (severity = load/capacity,
+-- warnRatio..1) - the structure groaning before it goes.
 function Stress.unsupported(
 	voxels: buffer,
 	sx: number,
@@ -37,8 +41,9 @@ function Stress.unsupported(
 	strengthLut: { [number]: number },
 	loadFactor: number,
 	densityLut: { [number]: number }?,
-	crushFactor: number?
-): { number }
+	crushFactor: number?,
+	warnRatio: number?
+): ({ number }, { Warning })
 	local total = sx * sy * sz
 	local sxsz = sx * sz
 	local dist = buffer.create(total * 2)
@@ -119,7 +124,9 @@ function Stress.unsupported(
 		end
 	end
 
+	local MAX_WARNINGS = 64
 	local broken = {}
+	local warnings: { Warning } = {}
 	local brokenFlags = buffer.create(total)
 	for index = 0, total - 1 do
 		local id = buffer.readu16(voxels, index * 2)
@@ -131,6 +138,8 @@ function Stress.unsupported(
 		if d == UNREACHED or d > capacity then
 			table.insert(broken, index)
 			buffer.writeu8(brokenFlags, index, 1)
+		elseif warnRatio and capacity > 0 and d > capacity * warnRatio and #warnings < MAX_WARNINGS then
+			table.insert(warnings, { index = index, severity = d / capacity })
 		end
 	end
 
@@ -153,7 +162,8 @@ function Stress.unsupported(
 						load = 0
 						continue
 					end
-					if load > (strengthLut[id] or 0) * crushFactor then
+					local capacity = (strengthLut[id] or 0) * crushFactor
+					if load > capacity then
 						if buffer.readu8(brokenFlags, index) == 0 then
 							table.insert(broken, index)
 							buffer.writeu8(brokenFlags, index, 1)
@@ -162,6 +172,12 @@ function Stress.unsupported(
 						-- break; restart the accumulation.
 						load = 0
 					else
+						if
+							warnRatio and capacity > 0 and load > capacity * warnRatio
+							and #warnings < MAX_WARNINGS and buffer.readu8(brokenFlags, index) == 0
+						then
+							table.insert(warnings, { index = index, severity = load / capacity })
+						end
 						load += densityLut[id] or 0
 					end
 				end
@@ -169,7 +185,7 @@ function Stress.unsupported(
 		end
 	end
 
-	return broken
+	return broken, warnings
 end
 
 return Stress

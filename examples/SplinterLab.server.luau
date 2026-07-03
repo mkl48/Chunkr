@@ -2,19 +2,23 @@
 -- (VoxBreaker-style). Real Parts subdivided into smaller real Parts -
 -- no voxel data, no materials, no fracture engine. Cheap and cheerful.
 --
+-- Every operation returns a Splint handle: .voxels are the captured parts
+-- (grouped in a Model under Workspace/_Bin/Voxels), :GetChunks() are the
+-- surviving uncaptured pieces of the original, :Restore() heals early.
+--
 -- Cycle, looping:
---   A  punch wall     ball hitboxes punch holes in a brick wall, voxels
---                     fly out, and the wall RESTORES itself between rounds
---                     (timeToReset) - self-healing cover
---   B  blade sweep    a thin box hitbox swept in an arc across a glass
---                     pane, like a melee slash: a clean gash of falling
---                     voxels, pane resets afterwards
---   C  pillar chop    Splinter.cutInHalf applied repeatedly to a pillar -
---                     it gets diced into segments that topple
---   D  combo          a wall is splintered, THEN world:Explode hits the
---                     pile: the surviving splinter chunks are still plain
---                     Parts, so the real engine ADOPTS them - Splinter and
---                     the full pipeline compose
+--   A  punch wall     ball hitboxes punch holes in a brick wall (kick
+--                     flings the voxels), wall restores via timeToReset -
+--                     self-healing cover. Shape-aware: the glass BALL next
+--                     to the wall splinters round, not boxy.
+--   B  moveable blade Splinter.attach: a hitbox WELDED to a spinning blade
+--                     part carves a trench through a glass pane as it
+--                     sweeps - VoxBreaker's moveable hitbox
+--   C  pillar chop    Splinter.cutInHalf x3 dices a pillar into 8
+--                     toppling segments
+--   D  combo          splinter a wall, then world:Explode ADOPTS the plain
+--                     chunks into real voxel bodies - Splinter and the full
+--                     engine compose; world:Reset({}) sweeps the arena
 --
 -- The floor is ChunkrIgnore'd so the focus stays on the props.
 -- Only one Chunkr example script ships Enabled at a time.
@@ -41,9 +45,12 @@ local world = Chunkr.new()
 world:Start()
 
 -- Plain anchored prop - ordinary Roblox part, no Chunkr anywhere.
-local function prop(name: string, size: Vector3, position: Vector3, material: Enum.Material, color: Color3): Part
+local function prop(name: string, size: Vector3, position: Vector3, material: Enum.Material, color: Color3, shape: Enum.PartType?): Part
 	local part = Instance.new("Part")
 	part.Name = name
+	if shape then
+		part.Shape = shape
+	end
 	part.Size = size
 	part.Position = position
 	part.Material = material
@@ -56,8 +63,8 @@ local function prop(name: string, size: Vector3, position: Vector3, material: En
 	return part
 end
 
--- Splinter derivatives keep the original's name, so restored/surviving
--- props are found by name each cycle (no duplicate stacking).
+-- Splinter restores keep the original's name, so props are found by name
+-- each cycle (no duplicate stacking).
 local function propNamed(name: string, make: () -> Part): Part
 	local existing = workspace:FindFirstChild(name)
 	if existing and existing:IsA("Part") then
@@ -66,57 +73,80 @@ local function propNamed(name: string, make: () -> Part): Part
 	return make()
 end
 
-local function fling(voxels: { BasePart }, from: Vector3, speed: number)
-	for _, voxel in voxels do
-		voxel.AssemblyLinearVelocity = (voxel.Position - from).Unit * speed + Vector3.new(0, 10, 0)
-	end
-end
-
 -- ---------------------------------------------------------------- stations
 
--- A: repeated ball punches; the wall heals itself via timeToReset.
+-- A: repeated ball punches; walls heal via timeToReset. The glass ball
+-- shows shape-aware subdivision (round silhouette, not a box).
 local function punchWall()
-	print("[A] punch wall: 3 ball hitboxes, wall restores in 7s")
+	print("[A] punch wall: 3 ball hitboxes + a shape-aware glass ball, resets in 7s")
 	local wall = propNamed("PunchWall", function()
 		return prop("PunchWall", Vector3.new(26, 14, 2), Vector3.new(-45, 7, -35), Enum.Material.Brick, Color3.fromRGB(155, 78, 62))
 	end)
-	for _ = 1, 3 do
-		local at = wall.Position + Vector3.new(math.random(-9, 9), math.random(-4, 4), 0)
-		local voxels = Splinter.hitbox({
+	local ball = propNamed("PunchBall", function()
+		return prop("PunchBall", Vector3.new(8, 8, 8), Vector3.new(-28, 4, -35), Enum.Material.Glass, Color3.fromRGB(160, 210, 225), Enum.PartType.Ball)
+	end)
+	for i = 1, 3 do
+		local at = if i < 3
+			then wall.Position + Vector3.new(math.random(-9, 9), math.random(-4, 4), 0)
+			else ball.Position + Vector3.new(math.random(-2, 2), math.random(-2, 2), 0)
+		local splint = Splinter.hitbox({
 			shape = "Ball",
 			cframe = CFrame.new(at),
 			size = Vector3.new(6, 6, 6),
 			minimumVoxelSize = 1,
 			timeToReset = 7,
 			unanchor = true,
+			kick = 22,
 		})
-		fling(voxels, at, 22)
-		print(`  -> {#voxels} voxels punched out`)
+		print(`  -> {#splint.voxels} voxels out, {#splint:GetChunks()} chunks standing`)
 		task.wait(0.8)
 	end
 end
 
--- B: a thin box hitbox swept along an arc = a melee slash. Every step is
--- one hitbox call; the record is shared, so ONE reset heals the whole gash.
-local function bladeSweep()
-	print("[B] blade sweep: thin box hitbox swept across a glass pane")
-	local pane = propNamed("SweepPane", function()
-		return prop("SweepPane", Vector3.new(24, 12, 1), Vector3.new(0, 6, -35), Enum.Material.Glass, Color3.fromRGB(160, 210, 225))
+-- B: the MOVEABLE hitbox - attached to a spinning blade part, sweeping a
+-- trench through a glass pane. One shared record = one reset heals it all.
+local function moveableBlade()
+	print("[B] moveable blade: Splinter.attach follows a spinning blade across a pane")
+	local pane = propNamed("BladePane", function()
+		return prop("BladePane", Vector3.new(24, 12, 1), Vector3.new(0, 6, -35), Enum.Material.Glass, Color3.fromRGB(160, 210, 225))
 	end)
+
+	-- A visible blade the hitbox follows (ChunkrIgnore: it's a tool, not a target).
+	local blade = Instance.new("Part")
+	blade.Name = "Blade"
+	blade.Size = Vector3.new(0.4, 6, 1.5)
+	blade.Color = Color3.fromRGB(220, 220, 230)
+	blade.Material = Enum.Material.Metal
+	blade.Anchored = true
+	blade.CanCollide = false
+	blade:SetAttribute("ChunkrIgnore", true)
+	blade.Parent = workspace
+
+	local hitbox = Splinter.attach({
+		follow = blade,
+		shape = "Box",
+		size = Vector3.new(2, 7, 3),
+		minimumVoxelSize = 0.75,
+		timeToReset = 8,
+		unanchor = true,
+		kick = 8,
+		interval = 0.06,
+	})
+	hitbox.OnSplinter:Connect(function(splint)
+		print(`  -> blade carved {#splint.voxels} voxels`)
+	end)
+
+	-- Sweep the blade through the pane in an arc.
 	local origin = pane.Position
-	for step = -5, 5 do
-		local at = origin + Vector3.new(step * 2, math.sin(step * 0.35) * 3, 0)
-		local voxels = Splinter.hitbox({
-			shape = "Box",
-			cframe = CFrame.new(at) * CFrame.Angles(0, 0, math.rad(20)),
-			size = Vector3.new(2.5, 5, 3),
-			minimumVoxelSize = 0.75,
-			timeToReset = 8,
-			unanchor = true,
-		})
-		fling(voxels, at + Vector3.new(0, 0, 2), 8)
-		task.wait(0.05) -- the sweep
+	for step = 0, 30 do
+		local t = step / 30
+		local x = -11 + t * 22
+		local y = math.sin(t * math.pi) * 4 - 1
+		blade.CFrame = CFrame.new(origin + Vector3.new(x, y, 0)) * CFrame.Angles(0, 0, math.rad(20 + t * 50))
+		task.wait(0.05)
 	end
+	hitbox:Destroy()
+	blade:Destroy()
 end
 
 -- C: cutInHalf, recursively - a pillar diced into toppling segments.
@@ -160,17 +190,16 @@ local function comboBreaker()
 
 	-- Phase 1: splinter. The 20s reset lands mid-cycle, so the pristine
 	-- wall is back well before the next combo round.
-	local at = wall.Position + Vector3.new(0, -2, 0)
-	local voxels = Splinter.hitbox({
+	local splint = Splinter.hitbox({
 		shape = "Ball",
-		cframe = CFrame.new(at),
+		cframe = CFrame.new(wall.Position + Vector3.new(0, -2, 0)),
 		size = Vector3.new(8, 8, 8),
 		minimumVoxelSize = 1.5,
 		timeToReset = 20,
 		unanchor = true,
+		kick = 15,
 	})
-	fling(voxels, at, 15)
-	print(`  -> phase 1: {#voxels} splinter voxels (plain parts)`)
+	print(`  -> phase 1: {#splint.voxels} splinter voxels (plain parts)`)
 
 	task.wait(2)
 	-- Phase 2: the engine. Splinter chunks are still ordinary Parts, so
@@ -185,11 +214,11 @@ local function comboBreaker()
 end
 
 task.wait(2)
-print("[splinterlab] Chunkr.Splinter. A: punch | B: blade sweep | C: pillar chop | D: engine combo")
+print("[splinterlab] Chunkr.Splinter. A: punch | B: moveable blade | C: pillar chop | D: engine combo")
 while true do
 	punchWall()
 	task.wait(9)
-	bladeSweep()
+	moveableBlade()
 	task.wait(10)
 	pillarChop()
 	task.wait(10)

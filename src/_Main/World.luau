@@ -9,8 +9,10 @@ local Materials = require(script.Parent.Parent._Patterns.Materials)
 local Fracture = require(script.Parent.Parent._Patterns.Fracture)
 local Impact = require(script.Parent.Parent._Patterns.Impact)
 local Adopt = require(script.Parent.Parent._Patterns.Adopt)
+local Fire = require(script.Parent.Parent._Patterns.Fire)
 local Bin = require(script.Parent.Parent._Utility.Bin)
 local Raycast = require(script.Parent.Parent._Utility.Raycast)
+local Persist = require(script.Parent.Parent._Utility.Persist)
 local Query = require(script.Parent.Parent._Utility.Query)
 local Grid = require(script.Parent.Parent._Utility.Grid)
 local Events = require(script.Parent.Parent._Utility.Events)
@@ -63,6 +65,83 @@ local function boundingSphere(body: Body.Body): (Vector3, number)
 	local extents = Vector3.new(body.volume.sx, body.volume.sy, body.volume.sz) * body.voxelSize
 	local center = body:GetPivot():PointToWorldSpace(extents / 2)
 	return center, extents.Magnitude / 2
+end
+
+-- ---------------------------------------------------------------- building
+
+local function axesAligned(rel: CFrame): boolean
+	return rel.XVector:Dot(Vector3.xAxis) > 0.999
+		and rel.YVector:Dot(Vector3.yAxis) > 0.999
+		and rel.ZVector:Dot(Vector3.zAxis) > 0.999
+end
+
+-- The construction op: stamps a solid box of `materialName`, sized
+-- `sizeStuds`, centred on `cframe`. When the box sits inside an existing
+-- aligned body it merges into that body's volume (repair a wall, extend a
+-- bridge); otherwise a new anchored body spawns. Returns the body touched.
+function World.Build(self: World, cframe: CFrame, sizeStuds: Vector3, materialName: string, voxelSize: number?): Body.Body?
+	local material = Materials.get(materialName)
+	local half = sizeStuds / 2
+
+	for _, body in self.bodies do
+		if body.destroyed or not body.carvable or not body.anchored then
+			continue
+		end
+		if voxelSize and math.abs(voxelSize - body.voxelSize) > 1e-3 then
+			continue
+		end
+		local rel = body:GetPivot():ToObjectSpace(cframe)
+		if not axesAligned(rel) then
+			continue
+		end
+		local vs = body.voxelSize
+		local volume = body.volume
+		local x0 = math.round((rel.Position.X - half.X) / vs)
+		local y0 = math.round((rel.Position.Y - half.Y) / vs)
+		local z0 = math.round((rel.Position.Z - half.Z) / vs)
+		local x1 = math.round((rel.Position.X + half.X) / vs) - 1
+		local y1 = math.round((rel.Position.Y + half.Y) / vs) - 1
+		local z1 = math.round((rel.Position.Z + half.Z) / vs) - 1
+		if
+			x0 >= 0 and y0 >= 0 and z0 >= 0 and x1 >= x0 and y1 >= y0 and z1 >= z0
+			and x1 < volume.sx and y1 < volume.sy and z1 < volume.sz
+		then
+			volume:FillBox(x0, y0, z0, x1, y1, z1, material.id)
+			body._stressDirty = true
+			-- Dirty volume -> next tick's topology confirms one island and
+			-- remeshes; the new voxels weld straight into the assembly.
+			return body
+		end
+	end
+
+	local vs = voxelSize or self.config.build.voxelSize
+	local sx = math.max(1, math.round(sizeStuds.X / vs))
+	local sy = math.max(1, math.round(sizeStuds.Y / vs))
+	local sz = math.max(1, math.round(sizeStuds.Z / vs))
+	if sx * sy * sz > self.config.build.maxVoxels then
+		warn(`[Chunkr] build: {sx}x{sy}x{sz} exceeds build.maxVoxels`)
+		return nil
+	end
+	local volume = Volume.new(sx, sy, sz)
+	volume:FillBox(0, 0, 0, sx - 1, sy - 1, sz - 1, material.id)
+	volume:ClearDirty()
+	local body = Body.fromVolume(volume, {
+		voxelSize = vs,
+		cframe = cframe * CFrame.new(-Vector3.new(sx, sy, sz) * vs / 2),
+		anchored = true,
+	})
+	body.needsRemesh = true
+	return self:Add(body)
+end
+
+-- Stamps a Blueprint into the world as a fresh body (prefab placement).
+function World.Place(self: World, blueprint: Blueprint.Blueprint, cframe: CFrame, anchored: boolean?): Body.Body
+	local body = Body.fromBlueprint(blueprint, {
+		cframe = cframe,
+		anchored = if anchored ~= nil then anchored else true,
+	})
+	body.needsRemesh = true
+	return self:Add(body)
 end
 
 -- ---------------------------------------------------------------- carve ops
@@ -145,7 +224,24 @@ function World.Explode(self: World, position: Vector3, radiusStuds: number, powe
 			end
 		end
 	end
+	-- Blasts start fires (parts in reach were already adopted above).
+	local fire = self.config.fire
+	if fire.enabled and fire.igniteFromExplosions then
+		Fire.igniteSphere(self, position, radiusStuds * fire.explosionIgniteScale)
+	end
 	return removed
+end
+
+-- Lights every flammable voxel in the sphere; plain parts in reach are
+-- adopted first, so a wooden shed catches from a torch with zero setup.
+function World.Ignite(self: World, position: Vector3, radiusStuds: number): number
+	if not self.config.fire.enabled then
+		return 0
+	end
+	if self.config.adopt.enabled then
+		Adopt.sweepRadius(self, position, radiusStuds)
+	end
+	return Fire.igniteSphere(self, position, radiusStuds)
 end
 
 function World.CutRay(self: World, origin: Vector3, target: Vector3, thicknessStuds: number, power: number?): number
@@ -323,6 +419,19 @@ function World.Reset(self: World, snapshot: Snapshot, parent: Instance?)
 		body.volume.dirty = { minX = 0, minY = 0, minZ = 0, maxX = body.volume.sx - 1, maxY = body.volume.sy - 1, maxZ = body.volume.sz - 1 }
 		self:Add(body)
 	end
+end
+
+-- Chunked DataStore save of the current snapshot (yields). `store` defaults
+-- to a DataStore named config.persist.dataStore; inject your own backend
+-- ({ read, write }) for MemoryStore/external saves/tests.
+function World.Save(self: World, key: string, store: Persist.Store?): number
+	return Persist.save(self, key, store or Persist.datastore(self.config.persist.dataStore))
+end
+
+-- Loads a saved snapshot and resets the world to it (yields). False when
+-- nothing is stored under `key`.
+function World.Load(self: World, key: string, store: Persist.Store?, parent: Instance?): boolean
+	return Persist.load(self, key, store or Persist.datastore(self.config.persist.dataStore), parent)
 end
 
 function World.Destroy(self: World)

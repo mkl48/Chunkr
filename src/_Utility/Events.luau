@@ -18,6 +18,19 @@ local Events = {
 	-- (positionWorld, material, voxelCount) for islands below the debris floor
 	-- (the engine deletes them; the game decides if they become particles)
 	OnCrumble = Signal.new(),
+	-- (body, positionWorld, severity 0..1, warningCount) when a stress check
+	-- finds voxels loaded near capacity but still holding - the structure
+	-- groaning before the collapse. Cooldown per body (stress.creakCooldown).
+	OnCreak = Signal.new(),
+	-- (body, voxelCount, positionWorld) when voxels newly catch fire
+	OnIgnite = Signal.new(),
+	-- (body, burningCount, positionWorld) every fire tick while a body burns
+	-- (position samples one burning voxel - flame/smoke emitters track it)
+	OnBurn = Signal.new(),
+	-- (body, burnedCount, positionWorld) when voxels finish burning away
+	OnBurnout = Signal.new(),
+	-- (joint) when a Joint's host voxel/part is destroyed and it gives way
+	OnJointBroken = Signal.new(),
 	-- (body) lifecycle
 	OnBodyAdded = Signal.new(),
 	OnBodyRemoved = Signal.new(),

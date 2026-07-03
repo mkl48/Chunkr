@@ -7,6 +7,7 @@
 
 local Dispatch = require(script.Parent.Parent._Packages.Substance.Particle.Dispatch)
 local Events = require(script.Parent.Parent._Utility.Events)
+local Materials = require(script.Parent.Parent._Patterns.Materials)
 
 local Network = {}
 
@@ -52,6 +53,16 @@ function Network.startServer(world: any, config: any)
 		elseif payload.type == "cut" and finiteVector(payload.origin) and finiteVector(payload.target) then
 			local thickness = math.clamp(tonumber(payload.thickness) or 0, 0, maxRadius)
 			world:CutRay(payload.origin, payload.target, thickness, tonumber(payload.power))
+		elseif payload.type == "build" and finiteVector(payload.position) and finiteVector(payload.size) and type(payload.material) == "string" then
+			local maxSize = config.net.maxBuildSize
+			local size = Vector3.new(
+				math.clamp(payload.size.X, 0.5, maxSize),
+				math.clamp(payload.size.Y, 0.5, maxSize),
+				math.clamp(payload.size.Z, 0.5, maxSize)
+			)
+			if Materials.find(payload.material) then
+				world:Build(CFrame.new(payload.position), size, payload.material)
+			end
 		end
 	end))
 
@@ -69,6 +80,18 @@ function Network.startServer(world: any, config: any)
 	end)
 	Events.OnCrumble:Connect(function(position, material, count)
 		Dispatch.Broadcast(FX, { t = "crumble", p = position, m = material and material.name, n = count })
+	end)
+	Events.OnCreak:Connect(function(_body, position, severity, count)
+		Dispatch.Broadcast(FX, { t = "creak", p = position, s = severity, n = count })
+	end)
+	Events.OnIgnite:Connect(function(_body, count, position)
+		Dispatch.Broadcast(FX, { t = "ignite", p = position, n = count })
+	end)
+	Events.OnBurn:Connect(function(_body, count, position)
+		Dispatch.Broadcast(FX, { t = "fire", p = position, n = count })
+	end)
+	Events.OnBurnout:Connect(function(_body, count, position)
+		Dispatch.Broadcast(FX, { t = "burnout", p = position, n = count })
 	end)
 	Events.OnSplit:Connect(function(body, fragments)
 		Dispatch.Broadcast(FX, { t = "split", p = body:GetPivot().Position, n = #fragments })
@@ -94,6 +117,10 @@ end
 
 function Network.requestCut(origin: Vector3, target: Vector3, thickness: number, power: number?)
 	Dispatch.Post(OP, { type = "cut", origin = origin, target = target, thickness = thickness, power = power })
+end
+
+function Network.requestBuild(position: Vector3, size: Vector3, material: string)
+	Dispatch.Post(OP, { type = "build", position = position, size = size, material = material })
 end
 
 return Network

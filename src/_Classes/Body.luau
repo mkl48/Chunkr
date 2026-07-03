@@ -66,9 +66,22 @@ export type Body = typeof(setmetatable(
 		_lastFracture: { position: Vector3, impulse: number, at: number }?,
 		-- Detach-mode fracture labels awaiting a barrier Topology pass.
 		_pendingDetach: buffer?,
+		-- Active fire on this body's CURRENT volume (owned by Patterns/Fire;
+		-- splits/replacements extinguish by identity mismatch).
+		_fire: FireState?,
+		-- Last OnCreak emission (stress groan cooldown).
+		_lastCreak: number?,
 	},
 	Body
 ))
+
+export type FireState = {
+	volume: Volume.Volume,
+	-- Voxel index (x + z*sx + y*sx*sz) -> seconds of fuel left.
+	burning: { [number]: number },
+	count: number,
+	lastTick: number,
+}
 
 function Body.fromVolume(volume: Volume.Volume, config: Config?): Body
 	local cfg: Config = config or {}
@@ -99,6 +112,8 @@ function Body.fromVolume(volume: Volume.Volume, config: Config?): Body
 		_pendingAngularVelocity = nil,
 		_lastFracture = nil,
 		_pendingDetach = nil,
+		_fire = nil,
+		_lastCreak = nil,
 	}, Body)
 
 	model:SetAttribute(Body.ID_ATTRIBUTE, self.id)

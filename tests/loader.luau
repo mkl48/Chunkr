@@ -29,6 +29,7 @@ local FILES = {
 	["_Utility.Raycast"] = "src/_Utility/Raycast.luau",
 	["_Utility.Query"] = "src/_Utility/Query.luau",
 	["_Utility.Vox"] = "src/_Utility/Vox.luau",
+	["_Utility.Persist"] = "src/_Utility/Persist.luau",
 }
 
 local nodeMt = {}

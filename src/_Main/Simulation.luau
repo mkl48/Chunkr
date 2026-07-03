@@ -14,9 +14,11 @@ local Workers = require(script.Parent.Workers)
 local Body = require(script.Parent.Parent._Classes.Body)
 local Volume = require(script.Parent.Parent._Classes.Volume)
 local Anchor = require(script.Parent.Parent._Classes.Anchor)
+local Joint = require(script.Parent.Parent._Classes.Joint)
 local Materials = require(script.Parent.Parent._Patterns.Materials)
 local Fracture = require(script.Parent.Parent._Patterns.Fracture)
 local Impact = require(script.Parent.Parent._Patterns.Impact)
+local Fire = require(script.Parent.Parent._Patterns.Fire)
 local Carve = require(script.Parent.Parent._Patterns.Carve)
 local Debris = require(script.Parent.Parent._Patterns.Debris)
 local Topology = require(script.Parent.Parent._Patterns.Topology)
@@ -284,7 +286,7 @@ local function step(world: any)
 
 			local snap = buffer.create(buffer.len(volume.voxels))
 			buffer.copy(snap, 0, volume.voxels, 0)
-			Workers.dispatch("stress", function(broken)
+			Workers.dispatch("stress", function(broken, warnings)
 				if body.destroyed or body.volume ~= volume then
 					return
 				end
@@ -296,8 +298,30 @@ local function step(world: any)
 					volume:Set(x, y, z, 0)
 				end
 				-- Deleting marks dirty -> next tick's Topology drops the pieces.
-			end, snap, volume.sx, volume.sy, volume.sz, seeds, strengthLut(), config.stress.loadFactor, densityLut(), config.stress.crushFactor)
+
+				-- Groans: loaded near capacity but holding - fire the worst
+				-- spot so games can creak/dust BEFORE the collapse.
+				if warnings and #warnings > 0 and os.clock() - (body._lastCreak or 0) >= config.stress.creakCooldown then
+					body._lastCreak = os.clock()
+					local worst = warnings[1]
+					for _, warning in warnings do
+						if warning.severity > worst.severity then
+							worst = warning
+						end
+					end
+					local x = worst.index % volume.sx
+					local y = worst.index // sxsz
+					local z = (worst.index // volume.sx) % volume.sz
+					Events.OnCreak:Fire(body, body:LocalToWorld(x, y, z), worst.severity, #warnings)
+				end
+			end, snap, volume.sx, volume.sy, volume.sz, seeds, strengthLut(), config.stress.loadFactor, densityLut(), config.stress.crushFactor, config.stress.warnRatio)
 		end
+	end
+
+	-- 3.5. Fire: burn fuel down, spread, delete burnt voxels (the deletions
+	-- feed step 2's topology next tick, so burnt-through pieces drop).
+	if config.fire.enabled then
+		Fire.step(world)
 	end
 
 	-- 4. Anchors ride their (possibly moving) bodies.
@@ -308,6 +332,9 @@ local function step(world: any)
 			end
 		end
 	end
+
+	-- 4.5. Joints re-link after rebuilds/migrations, break on dead voxels.
+	Joint.step()
 
 	-- 5. Debris housekeeping, once a second.
 	local now = os.clock()

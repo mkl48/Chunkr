@@ -11,8 +11,9 @@
 -- stay within the config voxel budget (baseplates become coarse voxels
 -- rather than a million fine ones).
 --
--- Limitations (v1): the part's AABB is voxelized as a solid box - wedges,
--- cylinders and unions adopt as their bounding box. Server only.
+-- Shape fidelity: primitive Parts fill analytically (balls round, wedges
+-- sloped); MeshParts/unions raycast-sample their true collision shape when
+-- adopt.meshSampling is on (bounding box past the column budget). Server only.
 
 local CollectionService = game:GetService("CollectionService")
 
@@ -23,6 +24,7 @@ local Materials = require(script.Parent.Materials)
 local Fracture = require(script.Parent.Fracture)
 local Boxer = require(script.Parent.Boxer)
 local Bin = require(script.Parent.Parent._Utility.Bin)
+local Shapes = require(script.Parent.Parent._Utility.Shapes)
 
 local Adopt = {}
 
@@ -34,13 +36,14 @@ type Preset = {
 	toughness: number,
 	archetype: ("glass" | "stone" | "wood")?,
 	breakMode: Types.BreakMode?,
+	flammability: number?,
 }
 
 local PRESETS: { [Enum.Material]: Preset } = {
 	[Enum.Material.Glass] = { density = 2.5, strength = 1, toughness = 8, archetype = "glass" },
 	[Enum.Material.Ice] = { density = 0.9, strength = 1, toughness = 10, archetype = "glass" },
-	[Enum.Material.Wood] = { density = 0.4, strength = 2, toughness = 50, archetype = "wood", breakMode = "detach" },
-	[Enum.Material.WoodPlanks] = { density = 0.4, strength = 2, toughness = 50, archetype = "wood", breakMode = "detach" },
+	[Enum.Material.Wood] = { density = 0.4, strength = 2, toughness = 50, archetype = "wood", breakMode = "detach", flammability = 0.85 },
+	[Enum.Material.WoodPlanks] = { density = 0.4, strength = 2, toughness = 50, archetype = "wood", breakMode = "detach", flammability = 0.85 },
 	[Enum.Material.Brick] = { density = 1.8, strength = 6, toughness = 120, archetype = "stone" },
 	[Enum.Material.Concrete] = { density = 2.6, strength = 9, toughness = 300, archetype = "stone" },
 	[Enum.Material.Cobblestone] = { density = 2.4, strength = 6, toughness = 150, archetype = "stone" },
@@ -96,6 +99,7 @@ local function resolveMaterial(part: BasePart): Types.Material
 		transparency = part.Transparency,
 		reflectance = part.Reflectance,
 		breakMode = preset.breakMode,
+		flammability = preset.flammability,
 		fractureTable = buildTable(preset.archetype, preset.toughness),
 	})
 end
@@ -123,34 +127,84 @@ function Adopt.eligible(part: Instance): boolean
 	return true
 end
 
--- Shape-aware fill predicate: voxel centre (px,py,pz) in part-local studs,
--- `half` = part.Size/2. Balls voxelize round, cylinders round-along-X,
--- wedges sloped; everything else fills its box.
-local function occupied(part: BasePart, px: number, py: number, pz: number, half: Vector3): boolean
-	-- Rounded dims can overhang the true size by half a voxel; trim to size.
-	if math.abs(px) > half.X or math.abs(py) > half.Y or math.abs(pz) > half.Z then
-		return false
-	end
-	if part:IsA("Part") then
-		local shape = part.Shape
-		if shape == Enum.PartType.Ball then
-			local radius = math.min(half.X, half.Y, half.Z)
-			return px * px + py * py + pz * pz <= radius * radius
-		elseif shape == Enum.PartType.Cylinder then
-			-- Roblox cylinders lie along X.
-			local radius = math.min(half.Y, half.Z)
-			return py * py + pz * pz <= radius * radius
-		elseif shape == Enum.PartType.Wedge then
-			return (py + half.Y) / (half.Y * 2) <= (pz + half.Z) / (half.Z * 2)
-		elseif shape == Enum.PartType.CornerWedge then
-			local yFrac = (py + half.Y) / (half.Y * 2)
-			return yFrac <= (px + half.X) / (half.X * 2) and yFrac <= (half.Z - pz) / (half.Z * 2)
+-- Shape-aware fill lives in _Utility/Shapes: balls voxelize round, cylinders
+-- round-along-X, wedges sloped; everything else fills its box. (Rounded voxel
+-- dims can overhang the true size by half a voxel; Shapes trims to size.)
+
+-- ------------------------------------------------------------ mesh sampling
+-- MeshParts/unions sample their TRUE collision shape: per (x,z) column, a
+-- downward ray marches the span TOPS and an upward ray marches the span
+-- BOTTOMS (rays never hit backfaces of the hulls they start inside, so each
+-- direction sees exactly one side of every solid span). Sorted and paired,
+-- the spans fill the column - concave unions with holes come out right.
+-- Falls back to the bounding box past the column budget.
+
+local MAX_MARCH = 16
+
+-- Ray-marches all surface crossings, returning their part-local Y values.
+local function marchColumn(part: BasePart, origin: Vector3, direction: Vector3, length: number, params: RaycastParams, out: { number })
+	table.clear(out)
+	local remaining = length
+	local from = origin
+	for _ = 1, MAX_MARCH do
+		if remaining <= 0 then
+			break
 		end
-		return true -- Block
-	elseif part:IsA("WedgePart") then
-		return (py + half.Y) / (half.Y * 2) <= (pz + half.Z) / (half.Z * 2)
+		local hit = workspace:Raycast(from, direction * remaining, params)
+		if not hit then
+			break
+		end
+		table.insert(out, part.CFrame:PointToObjectSpace(hit.Position).Y)
+		local step = (hit.Position - from).Magnitude + 0.01
+		from += direction * step
+		remaining -= step
 	end
-	return true -- MeshPart/unions/etc: bounding box (v1)
+end
+
+local function meshFill(part: BasePart, volume: Volume.Volume, materialId: number, voxelSize: number, originOffset: Vector3, sx: number, sy: number, sz: number)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Include
+	params.FilterDescendantsInstances = { part }
+
+	local cf = part.CFrame
+	local half = part.Size / 2
+	local margin = voxelSize
+	local length = half.Y * 2 + margin * 2
+	local down = -cf.YVector
+	local up = cf.YVector
+	local tops: { number } = {}
+	local bottoms: { number } = {}
+
+	for z = 0, sz - 1 do
+		for x = 0, sx - 1 do
+			local lx = (x + 0.5) * voxelSize - originOffset.X
+			local lz = (z + 0.5) * voxelSize - originOffset.Z
+			marchColumn(part, cf:PointToWorldSpace(Vector3.new(lx, half.Y + margin, lz)), down, length, params, tops)
+			if #tops == 0 then
+				continue
+			end
+			marchColumn(part, cf:PointToWorldSpace(Vector3.new(lx, -half.Y - margin, lz)), up, length, params, bottoms)
+			table.sort(tops)
+			table.sort(bottoms)
+			local spans = math.min(#tops, #bottoms)
+			for s = 1, spans do
+				local bottom, top = bottoms[s], tops[s]
+				-- Thin shells still deserve their surface voxel.
+				local y0 = math.floor((bottom + originOffset.Y) / voxelSize)
+				local y1 = math.ceil((top + originOffset.Y) / voxelSize) - 1
+				if y1 < y0 then
+					y0 = math.clamp(math.round(((bottom + top) / 2 + originOffset.Y) / voxelSize - 0.5), 0, sy - 1)
+					y1 = y0
+				end
+				for y = math.max(0, y0), math.min(sy - 1, y1) do
+					local centreY = (y + 0.5) * voxelSize - originOffset.Y
+					if centreY >= bottom - voxelSize * 0.5 and centreY <= top + voxelSize * 0.5 then
+						volume:Set(x, y, z, materialId)
+					end
+				end
+			end
+		end
+	end
 end
 
 -- Voxelizes one part into a Body (solid box at inferred resolution),
@@ -198,15 +252,23 @@ function Adopt.part(world: any, part: BasePart): Body.Body?
 	local material = resolveMaterial(part)
 	local volume = Volume.new(sx, sy, sz)
 	local half = size / 2
+	local kind = Shapes.kind(part)
 	local originOffset = Vector3.new(sx, sy, sz) * voxelSize / 2
-	for y = 0, sy - 1 do
-		for z = 0, sz - 1 do
-			for x = 0, sx - 1 do
-				local px = (x + 0.5) * voxelSize - originOffset.X
-				local py = (y + 0.5) * voxelSize - originOffset.Y
-				local pz = (z + 0.5) * voxelSize - originOffset.Z
-				if occupied(part, px, py, pz, half) then
-					volume:Set(x, y, z, material.id)
+	local meshy = (part:IsA("MeshPart") or part:IsA("PartOperation"))
+		and cfg.meshSampling
+		and sx * sz <= cfg.meshColumnBudget
+	if meshy then
+		meshFill(part, volume, material.id, voxelSize, originOffset, sx, sy, sz)
+	else
+		for y = 0, sy - 1 do
+			for z = 0, sz - 1 do
+				for x = 0, sx - 1 do
+					local px = (x + 0.5) * voxelSize - originOffset.X
+					local py = (y + 0.5) * voxelSize - originOffset.Y
+					local pz = (z + 0.5) * voxelSize - originOffset.Z
+					if Shapes.contains(kind, px, py, pz, half) then
+						volume:Set(x, y, z, material.id)
+					end
 				end
 			end
 		end

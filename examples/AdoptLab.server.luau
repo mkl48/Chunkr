@@ -138,19 +138,16 @@ local function splinterPunch()
 
 	task.wait(1)
 	local punchAt = wall.Position + Vector3.new(math.random(-6, 6), math.random(-3, 3), 0)
-	local voxels = Chunkr.Splinter.hitbox({
+	local splint = Chunkr.Splinter.hitbox({
 		shape = "Ball",
 		cframe = CFrame.new(punchAt),
 		size = Vector3.new(7, 7, 7),
 		minimumVoxelSize = 1,
 		timeToReset = 8,
 		unanchor = true,
+		kick = 25, -- radial fling away from the punch
 	})
-	print(`  -> {#voxels} voxels punched out`)
-	-- Fling them away from the punch.
-	for _, voxel in voxels do
-		voxel.AssemblyLinearVelocity = (voxel.Position - punchAt).Unit * 25 + Vector3.new(0, 12, 0)
-	end
+	print(`  -> {#splint.voxels} voxels punched out, {#splint:GetChunks()} chunks left standing`)
 end
 
 task.wait(2)

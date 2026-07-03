@@ -72,10 +72,12 @@ local Volume = require(script._Classes.Volume)
 local Body = require(script._Classes.Body)
 local Blueprint = require(script._Classes.Blueprint)
 local Anchor = require(script._Classes.Anchor)
+local Joint = require(script._Classes.Joint)
 local FracturePattern = require(script._Classes.FracturePattern)
 local Materials = require(script._Patterns.Materials)
 local Fracture = require(script._Patterns.Fracture)
 local Splinter = require(script._Patterns.Splinter)
+local Persist = require(script._Utility.Persist)
 local World = require(script._Main.World)
 local Server = require(script._Main.Server)
 local Client = require(script._Main.Client)
@@ -96,9 +98,15 @@ Chunkr.Fracture = Fracture
 Chunkr.FracturePattern = FracturePattern
 Chunkr.Blueprint = Blueprint
 Chunkr.Anchor = Anchor
+-- Constraints between voxel positions that survive rebuilds/splits and
+-- break when their host voxel dies (hinged doors, hanging signs, bolts).
+Chunkr.Joint = Joint
 Chunkr.Volume = Volume
 Chunkr.Vox = Vox
 Chunkr.Events = Events
+-- Snapshot <-> DataStore codec (world:Save/Load are the easy path; this is
+-- the raw encode/decode/store surface for custom backends).
+Chunkr.Persist = Persist
 
 export type Material = Types.Material
 export type FractureTable = Types.FractureTable
@@ -195,6 +203,13 @@ function Chunkr.CutRay(self: Chunkr, origin: Vector3, target: Vector3, thickness
 	return self.world:CutRay(origin, target, thicknessStuds, power)
 end
 
+-- Lights every flammable voxel in the sphere (plain parts in reach are
+-- adopted first). Fire spreads by material flammability, then burnt voxels
+-- delete - collapse follows naturally. Explosions also auto-ignite.
+function Chunkr.Ignite(self: Chunkr, position: Vector3, radiusStuds: number): number
+	return self.world:Ignite(position, radiusStuds)
+end
+
 function Chunkr.Raycast(self: Chunkr, origin: Vector3, direction: Vector3, maxDistance: number): Types.RaycastHit?
 	return self.world:Raycast(origin, direction, maxDistance)
 end
@@ -215,6 +230,31 @@ end
 
 function Chunkr.Reset(self: Chunkr, snapshot: World.Snapshot, parent: Instance?)
 	self.world:Reset(snapshot, parent)
+end
+
+-- ---------------------------------------------------------------- building
+
+-- Stamps a solid box of `materialName` centred on `at`. Merges into an
+-- existing aligned body when the box fits inside one; otherwise a new
+-- anchored body spawns.
+function Chunkr.Build(self: Chunkr, at: CFrame | Vector3, sizeStuds: Vector3, materialName: string, voxelSize: number?): Body.Body?
+	local cframe = if typeof(at) == "CFrame" then at else CFrame.new(at :: Vector3)
+	return self.world:Build(cframe, sizeStuds, materialName, voxelSize)
+end
+
+-- Stamps a Blueprint as a fresh body (prefab placement).
+function Chunkr.Place(self: Chunkr, blueprint: Blueprint.Blueprint, cframe: CFrame, anchored: boolean?): Body.Body
+	return self.world:Place(blueprint, cframe, anchored)
+end
+
+-- Chunked DataStore persistence (yields). Store defaults to a DataStore
+-- named config.persist.dataStore; inject { read, write } for custom backends.
+function Chunkr.Save(self: Chunkr, key: string, store: Persist.Store?): number
+	return self.world:Save(key, store)
+end
+
+function Chunkr.Load(self: Chunkr, key: string, store: Persist.Store?, parent: Instance?): boolean
+	return self.world:Load(key, store, parent)
 end
 
 -- ---------------------------------------------------------------- lifecycle
@@ -631,9 +671,22 @@ export type Body = typeof(setmetatable(
 		_lastFracture: { position: Vector3, impulse: number, at: number }?,
 		-- Detach-mode fracture labels awaiting a barrier Topology pass.
 		_pendingDetach: buffer?,
+		-- Active fire on this body's CURRENT volume (owned by Patterns/Fire;
+		-- splits/replacements extinguish by identity mismatch).
+		_fire: FireState?,
+		-- Last OnCreak emission (stress groan cooldown).
+		_lastCreak: number?,
 	},
 	Body
 ))
+
+export type FireState = {
+	volume: Volume.Volume,
+	-- Voxel index (x + z*sx + y*sx*sz) -> seconds of fuel left.
+	burning: { [number]: number },
+	count: number,
+	lastTick: number,
+}
 
 function Body.fromVolume(volume: Volume.Volume, config: Config?): Body
 	local cfg: Config = config or {}
@@ -664,6 +717,8 @@ function Body.fromVolume(volume: Volume.Volume, config: Config?): Body
 		_pendingAngularVelocity = nil,
 		_lastFracture = nil,
 		_pendingDetach = nil,
+		_fire = nil,
+		_lastCreak = nil,
 	}, Body)
 
 	model:SetAttribute(Body.ID_ATTRIBUTE, self.id)
@@ -1086,6 +1141,440 @@ end
 
 return FracturePattern
 ]])
+mod("Joint", _2, [[
+-- Joints: Roblox constraints between voxel positions that SURVIVE the
+-- engine's churn. Body parts are destroyed and rebuilt on every remesh, and
+-- voxels migrate to fragment bodies on splits - a naive HingeConstraint dies
+-- with the first crack. A Joint re-realizes its Attachments onto whichever
+-- Part contains its host voxel after every rebuild, follows the voxel onto
+-- fragments (endpoint tracking rides the same Anchor machinery splits
+-- already migrate), and BREAKS - firing Events.OnJointBroken - when a host
+-- voxel is destroyed.
+--
+--   local hinge = Joint.create({
+--       kind = "Hinge",                 -- "Weld"|"Hinge"|"Rope"|"Rod"|"BallSocket"|"Spring"
+--       bodyA = frame, positionA = hingeWorldPos,
+--       bodyB = door, positionB = hingeWorldPos, -- or partB = plainPart
+--       axis = Vector3.yAxis,           -- hinge/rotation primary axis
+--       props = { LimitsEnabled = true, UpperAngle = 110 },
+--   })
+--   hinge.OnBroken (per-joint signal) / Events.OnJointBroken (global)
+--   hinge:Break()  hinge:Destroy() (silent)
+--
+-- "Weld" is a rigid WeldConstraint between the containing parts (bolt two
+-- bodies together); everything else is an Attachment0/1 constraint. Rope/
+-- Rod/Spring default their length to the creation distance. Endpoints
+-- snap to the nearest solid voxel within 1 voxel of the given position.
+--
+-- v1 notes: a joint whose fragment is still waiting on its first rebuild is
+-- slack (constraint re-links on the fragment's OnBodyRebuilt). Joints are
+-- not captured in Snapshots. Server only.
+
+local Signal = require(script.Parent.Parent._Packages.Signal)
+local Body = require(script.Parent.Body)
+local Anchor = require(script.Parent.Anchor)
+local Events = require(script.Parent.Parent._Utility.Events)
+
+local Joint = {}
+Joint.__index = Joint
+
+export type Kind = "Weld" | "Hinge" | "Rope" | "Rod" | "BallSocket" | "Spring"
+
+local CONSTRAINT_CLASS: { [string]: string } = {
+	Hinge = "HingeConstraint",
+	Rope = "RopeConstraint",
+	Rod = "RodConstraint",
+	BallSocket = "BallSocketConstraint",
+	Spring = "SpringConstraint",
+}
+
+export type CreateOptions = {
+	kind: Kind,
+	bodyA: Body.Body,
+	positionA: Vector3,
+	-- Endpoint B: a second body, or a plain BasePart (door on a destructible
+	-- frame, sign hanging off a wall).
+	bodyB: Body.Body?,
+	partB: BasePart?,
+	positionB: Vector3,
+	-- Primary axis for Hinge (and attachment orientation generally).
+	axis: Vector3?,
+	-- Raw properties applied to the constraint instance.
+	props: { [string]: any }?,
+}
+
+type End = {
+	-- Body endpoints track their voxel through splits/rebuilds via Anchor.
+	anchor: Anchor.Anchor?,
+	-- Plain-part endpoints are fixed to the part.
+	part: BasePart?,
+	partOffset: CFrame?,
+	attachment: Attachment?,
+}
+
+export type Joint = typeof(setmetatable(
+	{} :: {
+		id: number,
+		kind: Kind,
+		axis: Vector3?,
+		props: { [string]: any }?,
+		broken: boolean,
+		restLength: number,
+		OnBroken: typeof(Signal.new()),
+		_a: End,
+		_b: End,
+		_constraint: Instance?,
+	},
+	Joint
+))
+
+local active: { Joint } = {}
+local nextId = 0
+local hooked = false
+
+-- ---------------------------------------------------------------- geometry
+
+local function frameAlong(position: Vector3, axis: Vector3?): CFrame
+	if not axis or axis.Magnitude < 1e-4 then
+		return CFrame.new(position)
+	end
+	local x = axis.Unit
+	local up = if math.abs(x:Dot(Vector3.yAxis)) > 0.9 then Vector3.zAxis else Vector3.yAxis
+	local z = x:Cross(up).Unit
+	local y = z:Cross(x)
+	return CFrame.fromMatrix(position, x, y, z)
+end
+
+-- The assembly Part whose box contains this voxel's centre.
+local function containingPart(body: Body.Body, x: number, y: number, z: number): BasePart?
+	local worldPos = body:LocalToWorld(x, y, z)
+	for _, part in body.model:GetChildren() do
+		if part:IsA("BasePart") then
+			local lp = part.CFrame:PointToObjectSpace(worldPos)
+			local h = part.Size / 2 + Vector3.one * 1e-3
+			if math.abs(lp.X) <= h.X and math.abs(lp.Y) <= h.Y and math.abs(lp.Z) <= h.Z then
+				return part
+			end
+		end
+	end
+	return nil
+end
+
+-- Voxel under `position`, or the nearest solid within 1 voxel (forgiving
+-- surface picks). Nil when there's nothing to grab.
+local function solidVoxelNear(body: Body.Body, position: Vector3): (number?, number?, number?)
+	local fx, fy, fz = body:WorldToLocal(position)
+	local bx, by, bz = math.floor(fx), math.floor(fy), math.floor(fz)
+	local best: { number }? = nil
+	local bestDist = math.huge
+	for dx = -1, 1 do
+		for dy = -1, 1 do
+			for dz = -1, 1 do
+				local x, y, z = bx + dx, by + dy, bz + dz
+				if body.volume:GetSafe(x, y, z) ~= 0 then
+					local d = (Vector3.new(x + 0.5, y + 0.5, z + 0.5) - Vector3.new(fx, fy, fz)).Magnitude
+					if d < bestDist then
+						bestDist = d
+						best = { x, y, z }
+					end
+				end
+			end
+		end
+	end
+	if best then
+		return best[1], best[2], best[3]
+	end
+	return nil, nil, nil
+end
+
+-- ---------------------------------------------------------------- realize
+
+-- (Re)parents an endpoint's Attachment onto the Part that currently hosts
+-- it. Returns false while that part doesn't exist yet (fragment awaiting its
+-- first rebuild) - the joint stays slack and retries.
+local function realizeEnd(e: End): boolean
+	if e.attachment and e.attachment.Parent then
+		return true
+	end
+	local host: BasePart? = nil
+	if e.anchor then
+		local anchor = e.anchor
+		if anchor.dead then
+			return false
+		end
+		host = containingPart(anchor.body, anchor.x, anchor.y, anchor.z)
+		if not host then
+			return false
+		end
+		local attachment = Instance.new("Attachment")
+		attachment.Parent = host
+		anchor.instance = attachment
+		Anchor.Sync(anchor) -- restores the voxel-relative pose
+		e.attachment = attachment
+	elseif e.part then
+		local part = e.part
+		if not part.Parent then
+			return false
+		end
+		local attachment = Instance.new("Attachment")
+		attachment.CFrame = e.partOffset or CFrame.identity
+		attachment.Parent = part
+		e.attachment = attachment
+	end
+	return e.attachment ~= nil and e.attachment.Parent ~= nil
+end
+
+local function realize(self: Joint)
+	if self._constraint then
+		self._constraint:Destroy()
+		self._constraint = nil
+	end
+	if self.broken then
+		return
+	end
+	if not (realizeEnd(self._a) and realizeEnd(self._b)) then
+		return -- slack until both hosts exist; step()/rebuild retries
+	end
+	local attachmentA = self._a.attachment :: Attachment
+	local attachmentB = self._b.attachment :: Attachment
+
+	local constraint: Instance
+	if self.kind == "Weld" then
+		local weld = Instance.new("WeldConstraint")
+		weld.Part0 = attachmentA.Parent :: BasePart
+		weld.Part1 = attachmentB.Parent :: BasePart
+		constraint = weld
+	else
+		local instance = Instance.new(CONSTRAINT_CLASS[self.kind]) :: any
+		instance.Attachment0 = attachmentA
+		instance.Attachment1 = attachmentB
+		if self.kind == "Rope" or self.kind == "Rod" then
+			instance.Length = self.restLength
+		elseif self.kind == "Spring" then
+			instance.FreeLength = self.restLength
+		end
+		if self.props then
+			for key, value in self.props do
+				instance[key] = value
+			end
+		end
+		constraint = instance
+	end
+	constraint.Name = `ChunkrJoint_{self.id}`
+	constraint.Parent = attachmentA.Parent
+	self._constraint = constraint
+end
+
+-- Does this endpoint still have something to hold onto?
+local function endAlive(e: End): boolean
+	if e.anchor then
+		local anchor = e.anchor
+		return not anchor.dead
+			and not anchor.body.destroyed
+			and anchor.body.volume:GetSafe(anchor.x, anchor.y, anchor.z) ~= 0
+	end
+	return e.part ~= nil and (e.part :: BasePart).Parent ~= nil
+end
+
+-- ---------------------------------------------------------------- API
+
+function Joint.create(options: CreateOptions): Joint?
+	assert(options.bodyB or options.partB, "Joint.create needs bodyB or partB")
+	assert(options.kind == "Weld" or CONSTRAINT_CLASS[options.kind], `unknown joint kind {options.kind}`)
+
+	local endA: End? = nil
+	local ax, ay, az = solidVoxelNear(options.bodyA, options.positionA)
+	if ax ~= nil and ay ~= nil and az ~= nil then
+		local hostA = containingPart(options.bodyA, ax, ay, az)
+		if hostA then
+			local attachment = Instance.new("Attachment")
+			attachment.WorldCFrame = frameAlong(options.positionA, options.axis)
+			attachment.Parent = hostA
+			endA = {
+				anchor = Anchor.attach(options.bodyA, ax, ay, az, attachment, false),
+				part = nil,
+				partOffset = nil,
+				attachment = attachment,
+			}
+		end
+	end
+	if not endA then
+		return nil -- nothing solid to grab at positionA
+	end
+
+	local endB: End? = nil
+	if options.bodyB then
+		local bodyB = options.bodyB
+		local bx, by, bz = solidVoxelNear(bodyB, options.positionB)
+		if bx ~= nil and by ~= nil and bz ~= nil then
+			local hostB = containingPart(bodyB, bx, by, bz)
+			if hostB then
+				local attachment = Instance.new("Attachment")
+				attachment.WorldCFrame = frameAlong(options.positionB, options.axis)
+				attachment.Parent = hostB
+				endB = {
+					anchor = Anchor.attach(bodyB, bx, by, bz, attachment, false),
+					part = nil,
+					partOffset = nil,
+					attachment = attachment,
+				}
+			end
+		end
+	else
+		local partB = options.partB :: BasePart
+		if partB.Parent then
+			local attachment = Instance.new("Attachment")
+			attachment.WorldCFrame = frameAlong(options.positionB, options.axis)
+			attachment.Parent = partB
+			endB = {
+				anchor = nil,
+				part = partB,
+				partOffset = partB.CFrame:ToObjectSpace(attachment.WorldCFrame),
+				attachment = attachment,
+			}
+		end
+	end
+	if not endB then
+		local anchorA = endA.anchor
+		if anchorA then
+			Anchor.Detach(anchorA)
+		end
+		if endA.attachment then
+			endA.attachment:Destroy()
+		end
+		return nil
+	end
+
+	nextId += 1
+	local self = setmetatable({
+		id = nextId,
+		kind = options.kind,
+		axis = options.axis,
+		props = options.props,
+		broken = false,
+		restLength = (options.positionA - options.positionB).Magnitude,
+		OnBroken = Signal.new(),
+		_a = endA,
+		_b = endB,
+		_constraint = nil :: Instance?,
+	}, Joint)
+
+	realize(self)
+	table.insert(active, self)
+	Joint._hook()
+	return self
+end
+
+-- Rigid bolt between two bodies at a shared point.
+function Joint.weld(bodyA: Body.Body, bodyB: Body.Body, position: Vector3): Joint?
+	return Joint.create({ kind = "Weld", bodyA = bodyA, positionA = position, bodyB = bodyB, positionB = position })
+end
+
+-- The joint gives way: constraint destroyed, endpoints released, events fire.
+function Joint.Break(self: Joint)
+	if self.broken then
+		return
+	end
+	self.broken = true
+	if self._constraint then
+		self._constraint:Destroy()
+		self._constraint = nil
+	end
+	for _, e in { self._a, self._b } do
+		if e.anchor then
+			Anchor.Detach(e.anchor)
+		end
+		if e.attachment then
+			e.attachment:Destroy()
+			e.attachment = nil
+		end
+	end
+	self.OnBroken:Fire(self)
+	Events.OnJointBroken:Fire(self)
+	self.OnBroken:DisconnectAll()
+end
+
+-- Silent removal (no break events).
+function Joint.Destroy(self: Joint)
+	if self.broken then
+		return
+	end
+	self.broken = true
+	if self._constraint then
+		self._constraint:Destroy()
+		self._constraint = nil
+	end
+	for _, e in { self._a, self._b } do
+		if e.anchor then
+			Anchor.Detach(e.anchor)
+		end
+		if e.attachment then
+			e.attachment:Destroy()
+			e.attachment = nil
+		end
+	end
+	self.OnBroken:DisconnectAll()
+end
+
+-- ---------------------------------------------------------------- upkeep
+
+-- Rebuilds re-link, dead voxels break. Called every simulation tick (cheap:
+-- joints are few) and lazily hooked into rebuild events on first create.
+function Joint.step()
+	for i = #active, 1, -1 do
+		local joint = active[i]
+		if joint.broken then
+			table.remove(active, i)
+			continue
+		end
+		if not (endAlive(joint._a) and endAlive(joint._b)) then
+			joint:Break()
+			table.remove(active, i)
+			continue
+		end
+		-- Attachment lost its part (rebuild/migration): try to re-link.
+		local aLoose = joint._a.attachment == nil or (joint._a.attachment :: Attachment).Parent == nil
+		local bLoose = joint._b.attachment == nil or (joint._b.attachment :: Attachment).Parent == nil
+		if aLoose or bLoose then
+			if aLoose then
+				joint._a.attachment = nil
+			end
+			if bLoose then
+				joint._b.attachment = nil
+			end
+			realize(joint)
+		end
+	end
+end
+
+function Joint._hook()
+	if hooked then
+		return
+	end
+	hooked = true
+	-- Rebuild destroyed this body's parts (and any attachments on them);
+	-- re-link every joint endpoint hosted there immediately.
+	Events.OnBodyRebuilt:Connect(function(body)
+		for _, joint in active do
+			if joint.broken then
+				continue
+			end
+			local anchorA, anchorB = joint._a.anchor, joint._b.anchor
+			if (anchorA and anchorA.body == body) or (anchorB and anchorB.body == body) then
+				if joint._a.attachment and not joint._a.attachment.Parent then
+					joint._a.attachment = nil
+				end
+				if joint._b.attachment and not joint._b.attachment.Parent then
+					joint._b.attachment = nil
+				end
+				realize(joint)
+			end
+		end
+	end)
+end
+
+return Joint
+]])
 mod("Volume", _2, [[
 --!native
 -- A dense u16 voxel volume: the bag-of-voxels shared by Body, Blueprint,
@@ -1221,9 +1710,12 @@ local _3 = folder("_Main", _1)
 mod("Client", _3, [[
 -- Client boot: thin by design. Bodies replicate natively as Parts; the client
 -- only sends tool intents (Network.request*) and receives FX payloads
--- (Events.OnFx) to drive local particles/sounds.
+-- (Events.OnFx) to drive local particles/sounds. `Client.fx` is the stock
+-- handler for that stream - `Client.fx.start()` and destruction has dust,
+-- shards, flames and camera shake with zero custom code.
 
 local Network = require(script.Parent.Network)
+local Fx = require(script.Parent.Fx)
 
 local Client = {}
 
@@ -1237,11 +1729,317 @@ function Client.start()
 	Network.startClient()
 end
 
+Client.fx = Fx
 Client.RequestCarve = Network.requestCarve
 Client.RequestExplode = Network.requestExplode
 Client.RequestCut = Network.requestCut
+Client.RequestBuild = Network.requestBuild
 
 return Client
+]])
+mod("Fx", _3, [[
+-- Stock client FX: a ready-made handler for the server's OnFx payload
+-- stream, so destruction looks and sounds alive with one line:
+--
+--   Chunkr.client().fx.start()           -- everything on
+--   Chunkr.client().fx.start({ shake = false, sounds = false })
+--
+-- What it does per payload type:
+--   carve/fracture  dust burst + shards colored by the material's look,
+--                   sized by removed voxels / impulse
+--   crumble         a soft dust puff
+--   split           a sharper debris pop
+--   creak           faint dust drizzle (severity-scaled) - the warning
+--   ignite/fire     flame + smoke emitters that track the burning front
+--   burnout         a smoke puff as voxels burn away
+--   plus impulse-scaled camera shake for big fractures near the camera
+--
+-- Emitters are pooled on invisible anchored parts and recycled. Sounds are
+-- OFF unless you pass asset ids: fx.start({ soundIds = { fracture = "rbxassetid://...",
+-- crumble = ..., creak = ..., fire = ... } }). All knobs optional; call
+-- fx.stop() to disconnect. Client only.
+
+local Debris = game:GetService("Debris")
+
+local Events = require(script.Parent.Parent._Utility.Events)
+
+local Fx = {}
+
+type Options = {
+	particles: boolean?,
+	shake: boolean?,
+	sounds: boolean?,
+	soundIds: { [string]: string }?,
+	-- Max simultaneous effect parts (pool size).
+	budget: number?,
+	-- Shake strength multiplier (0 disables like shake = false).
+	shakeScale: number?,
+}
+
+local connection: any = nil
+local shakeConnection: RBXScriptConnection? = nil
+local options: Options = {}
+local trauma = 0
+
+-- ---------------------------------------------------------------- pool
+
+local pool: { Part } = {}
+local liveCount = 0
+
+local function acquire(position: Vector3): Part?
+	local budget = options.budget or 48
+	if liveCount >= budget then
+		return nil
+	end
+	local part = table.remove(pool)
+	if not part then
+		part = Instance.new("Part")
+		part.Name = "ChunkrFx"
+		part.Size = Vector3.one * 0.2
+		part.Transparency = 1
+		part.Anchored = true
+		part.CanCollide = false
+		part.CanQuery = false
+		part.CanTouch = false
+	end
+	part.Position = position
+	part.Parent = workspace
+	liveCount += 1
+	return part
+end
+
+local function release(part: Part, afterSeconds: number)
+	task.delay(afterSeconds, function()
+		liveCount -= 1
+		for _, child in part:GetChildren() do
+			child:Destroy()
+		end
+		if #pool < 16 then
+			part.Parent = nil
+			table.insert(pool, part)
+		else
+			part:Destroy()
+		end
+	end)
+end
+
+-- ---------------------------------------------------------------- pieces
+
+local function emit(part: Part, color: Color3, count: number, speed: number, size: number, lifetime: number, spread: number)
+	local emitter = Instance.new("ParticleEmitter")
+	emitter.Color = ColorSequence.new(color)
+	emitter.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, size),
+		NumberSequenceKeypoint.new(1, size * 0.4),
+	})
+	emitter.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.2),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+	emitter.Lifetime = NumberRange.new(lifetime * 0.6, lifetime)
+	emitter.Speed = NumberRange.new(speed * 0.5, speed)
+	emitter.SpreadAngle = Vector2.new(spread, spread)
+	emitter.Acceleration = Vector3.new(0, -workspace.Gravity * 0.15, 0)
+	emitter.Rate = 0
+	emitter.Parent = part
+	emitter:Emit(count)
+end
+
+local function smoke(part: Part, count: number, size: number)
+	local emitter = Instance.new("ParticleEmitter")
+	emitter.Color = ColorSequence.new(Color3.fromRGB(60, 55, 50), Color3.fromRGB(30, 30, 30))
+	emitter.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, size * 0.5),
+		NumberSequenceKeypoint.new(1, size * 2),
+	})
+	emitter.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.4),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+	emitter.Lifetime = NumberRange.new(0.8, 1.6)
+	emitter.Speed = NumberRange.new(1, 3)
+	emitter.SpreadAngle = Vector2.new(35, 35)
+	emitter.Acceleration = Vector3.new(0, 4, 0)
+	emitter.Rate = 0
+	emitter.Parent = part
+	emitter:Emit(count)
+end
+
+local function flame(part: Part, seconds: number)
+	local fire = Instance.new("Fire")
+	fire.Size = 4
+	fire.Heat = 8
+	fire.Parent = part
+	local light = Instance.new("PointLight")
+	light.Color = Color3.fromRGB(255, 160, 70)
+	light.Range = 12
+	light.Brightness = 1.5
+	light.Parent = part
+	task.delay(seconds, function()
+		fire.Enabled = false
+	end)
+end
+
+local function sound(part: Part, key: string, volume: number)
+	if options.sounds == false then
+		return
+	end
+	local ids = options.soundIds
+	local id = ids and ids[key]
+	if not id then
+		return
+	end
+	local s = Instance.new("Sound")
+	s.SoundId = id
+	s.Volume = volume
+	s.RollOffMaxDistance = 150
+	s.PlayOnRemove = false
+	s.Parent = part
+	s:Play()
+	Debris:AddItem(s, 4)
+end
+
+local function materialColor(name: string?): Color3
+	-- Adopted material names embed the part colour: Adopted_<Material>_<hex>.
+	if name then
+		local hex = string.match(name, "^Adopted_%w+_(%x%x%x%x%x%x)$")
+		if hex then
+			local ok, color = pcall(Color3.fromHex, hex)
+			if ok then
+				return color
+			end
+		end
+	end
+	return Color3.fromRGB(160, 150, 140)
+end
+
+local function addTrauma(amount: number, position: Vector3)
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	local distance = (camera.CFrame.Position - position).Magnitude
+	local falloff = math.clamp(1 - distance / 120, 0, 1)
+	trauma = math.min(trauma + amount * falloff * (options.shakeScale or 1), 1)
+end
+
+-- ---------------------------------------------------------------- handler
+
+local function handle(payload: any)
+	if type(payload) ~= "table" or typeof(payload.p) ~= "Vector3" then
+		return
+	end
+	local position: Vector3 = payload.p
+	local particles = options.particles ~= false
+
+	if payload.t == "fracture" then
+		local impulse = tonumber(payload.j) or 0
+		local part = particles and acquire(position) or nil
+		if part then
+			local color = materialColor(payload.m)
+			emit(part, color, math.clamp(6 + impulse // 40, 6, 30), 14, 0.35, 0.7, 60)
+			smoke(part, 4, 0.8)
+			sound(part, "fracture", math.clamp(0.3 + impulse / 800, 0.3, 1))
+			release(part, 2)
+		end
+		addTrauma(math.clamp(impulse / 1500, 0.05, 0.5), position)
+	elseif payload.t == "carve" then
+		local removed = tonumber(payload.n) or 0
+		local part = particles and acquire(position) or nil
+		if part then
+			emit(part, Color3.fromRGB(150, 140, 130), math.clamp(4 + removed // 20, 4, 25), 10, 0.3, 0.6, 70)
+			sound(part, "carve", 0.4)
+			release(part, 2)
+		end
+	elseif payload.t == "crumble" then
+		local part = particles and acquire(position) or nil
+		if part then
+			smoke(part, 6, 0.6)
+			sound(part, "crumble", 0.35)
+			release(part, 2.5)
+		end
+	elseif payload.t == "split" then
+		local part = particles and acquire(position) or nil
+		if part then
+			emit(part, Color3.fromRGB(120, 115, 110), 8, 8, 0.3, 0.5, 80)
+			sound(part, "split", 0.4)
+			release(part, 1.5)
+		end
+	elseif payload.t == "creak" then
+		local severity = tonumber(payload.s) or 0.7
+		local part = particles and acquire(position) or nil
+		if part then
+			smoke(part, math.clamp(math.round(severity * 5), 2, 6), 0.4)
+			sound(part, "creak", math.clamp(severity, 0.2, 0.9))
+			release(part, 2)
+		end
+	elseif payload.t == "ignite" or payload.t == "fire" then
+		local part = particles and acquire(position) or nil
+		if part then
+			flame(part, 0.9)
+			smoke(part, 2, 0.7)
+			if payload.t == "ignite" then
+				sound(part, "fire", 0.5)
+			end
+			release(part, 2.2)
+		end
+	elseif payload.t == "burnout" then
+		local part = particles and acquire(position) or nil
+		if part then
+			smoke(part, 5, 1)
+			release(part, 2.5)
+		end
+	end
+end
+
+-- ---------------------------------------------------------------- shake
+
+local function startShake()
+	if shakeConnection or options.shake == false then
+		return
+	end
+	local RunService = game:GetService("RunService")
+	local rng = Random.new()
+	shakeConnection = RunService.RenderStepped:Connect(function(dt: number)
+		local camera = workspace.CurrentCamera
+		if trauma <= 0 or not camera then
+			trauma = 0
+			return
+		end
+		local shake = trauma * trauma
+		camera.CFrame *= CFrame.Angles(
+			rng:NextNumber(-1, 1) * 0.02 * shake,
+			rng:NextNumber(-1, 1) * 0.02 * shake,
+			rng:NextNumber(-1, 1) * 0.01 * shake
+		)
+		trauma = math.max(trauma - dt * 1.2, 0)
+	end)
+end
+
+-- ---------------------------------------------------------------- API
+
+function Fx.start(opts: Options?)
+	if connection then
+		return
+	end
+	options = opts or {}
+	connection = Events.OnFx:Connect(handle)
+	startShake()
+end
+
+function Fx.stop()
+	if connection then
+		connection:Disconnect()
+		connection = nil
+	end
+	if shakeConnection then
+		shakeConnection:Disconnect()
+		shakeConnection = nil
+	end
+	trauma = 0
+end
+
+return Fx
 ]])
 mod("Network", _3, [[
 -- Op transport over Substance. Two channels:
@@ -1253,6 +2051,7 @@ mod("Network", _3, [[
 
 local Dispatch = require(script.Parent.Parent._Packages.Substance.Particle.Dispatch)
 local Events = require(script.Parent.Parent._Utility.Events)
+local Materials = require(script.Parent.Parent._Patterns.Materials)
 
 local Network = {}
 
@@ -1298,6 +2097,16 @@ function Network.startServer(world: any, config: any)
 		elseif payload.type == "cut" and finiteVector(payload.origin) and finiteVector(payload.target) then
 			local thickness = math.clamp(tonumber(payload.thickness) or 0, 0, maxRadius)
 			world:CutRay(payload.origin, payload.target, thickness, tonumber(payload.power))
+		elseif payload.type == "build" and finiteVector(payload.position) and finiteVector(payload.size) and type(payload.material) == "string" then
+			local maxSize = config.net.maxBuildSize
+			local size = Vector3.new(
+				math.clamp(payload.size.X, 0.5, maxSize),
+				math.clamp(payload.size.Y, 0.5, maxSize),
+				math.clamp(payload.size.Z, 0.5, maxSize)
+			)
+			if Materials.find(payload.material) then
+				world:Build(CFrame.new(payload.position), size, payload.material)
+			end
 		end
 	end))
 
@@ -1315,6 +2124,18 @@ function Network.startServer(world: any, config: any)
 	end)
 	Events.OnCrumble:Connect(function(position, material, count)
 		Dispatch.Broadcast(FX, { t = "crumble", p = position, m = material and material.name, n = count })
+	end)
+	Events.OnCreak:Connect(function(_body, position, severity, count)
+		Dispatch.Broadcast(FX, { t = "creak", p = position, s = severity, n = count })
+	end)
+	Events.OnIgnite:Connect(function(_body, count, position)
+		Dispatch.Broadcast(FX, { t = "ignite", p = position, n = count })
+	end)
+	Events.OnBurn:Connect(function(_body, count, position)
+		Dispatch.Broadcast(FX, { t = "fire", p = position, n = count })
+	end)
+	Events.OnBurnout:Connect(function(_body, count, position)
+		Dispatch.Broadcast(FX, { t = "burnout", p = position, n = count })
 	end)
 	Events.OnSplit:Connect(function(body, fragments)
 		Dispatch.Broadcast(FX, { t = "split", p = body:GetPivot().Position, n = #fragments })
@@ -1340,6 +2161,10 @@ end
 
 function Network.requestCut(origin: Vector3, target: Vector3, thickness: number, power: number?)
 	Dispatch.Post(OP, { type = "cut", origin = origin, target = target, thickness = thickness, power = power })
+end
+
+function Network.requestBuild(position: Vector3, size: Vector3, material: string)
+	Dispatch.Post(OP, { type = "build", position = position, size = size, material = material })
 end
 
 return Network
@@ -1460,9 +2285,11 @@ local Workers = require(script.Parent.Workers)
 local Body = require(script.Parent.Parent._Classes.Body)
 local Volume = require(script.Parent.Parent._Classes.Volume)
 local Anchor = require(script.Parent.Parent._Classes.Anchor)
+local Joint = require(script.Parent.Parent._Classes.Joint)
 local Materials = require(script.Parent.Parent._Patterns.Materials)
 local Fracture = require(script.Parent.Parent._Patterns.Fracture)
 local Impact = require(script.Parent.Parent._Patterns.Impact)
+local Fire = require(script.Parent.Parent._Patterns.Fire)
 local Carve = require(script.Parent.Parent._Patterns.Carve)
 local Debris = require(script.Parent.Parent._Patterns.Debris)
 local Topology = require(script.Parent.Parent._Patterns.Topology)
@@ -1730,7 +2557,7 @@ local function step(world: any)
 
 			local snap = buffer.create(buffer.len(volume.voxels))
 			buffer.copy(snap, 0, volume.voxels, 0)
-			Workers.dispatch("stress", function(broken)
+			Workers.dispatch("stress", function(broken, warnings)
 				if body.destroyed or body.volume ~= volume then
 					return
 				end
@@ -1742,8 +2569,30 @@ local function step(world: any)
 					volume:Set(x, y, z, 0)
 				end
 				-- Deleting marks dirty -> next tick's Topology drops the pieces.
-			end, snap, volume.sx, volume.sy, volume.sz, seeds, strengthLut(), config.stress.loadFactor, densityLut(), config.stress.crushFactor)
+
+				-- Groans: loaded near capacity but holding - fire the worst
+				-- spot so games can creak/dust BEFORE the collapse.
+				if warnings and #warnings > 0 and os.clock() - (body._lastCreak or 0) >= config.stress.creakCooldown then
+					body._lastCreak = os.clock()
+					local worst = warnings[1]
+					for _, warning in warnings do
+						if warning.severity > worst.severity then
+							worst = warning
+						end
+					end
+					local x = worst.index % volume.sx
+					local y = worst.index // sxsz
+					local z = (worst.index // volume.sx) % volume.sz
+					Events.OnCreak:Fire(body, body:LocalToWorld(x, y, z), worst.severity, #warnings)
+				end
+			end, snap, volume.sx, volume.sy, volume.sz, seeds, strengthLut(), config.stress.loadFactor, densityLut(), config.stress.crushFactor, config.stress.warnRatio)
 		end
+	end
+
+	-- 3.5. Fire: burn fuel down, spread, delete burnt voxels (the deletions
+	-- feed step 2's topology next tick, so burnt-through pieces drop).
+	if config.fire.enabled then
+		Fire.step(world)
 	end
 
 	-- 4. Anchors ride their (possibly moving) bodies.
@@ -1754,6 +2603,9 @@ local function step(world: any)
 			end
 		end
 	end
+
+	-- 4.5. Joints re-link after rebuilds/migrations, break on dead voxels.
+	Joint.step()
 
 	-- 5. Debris housekeeping, once a second.
 	local now = os.clock()
@@ -1812,17 +2664,17 @@ local Workers = {}
 local parallel = false
 local actors: { Actor } = {}
 local reply: BindableEvent? = nil
-local pending: { [number]: (any) -> () } = {}
+local pending: { [number]: (...any) -> () } = {}
 local nextJobId = 0
 local roundRobin = 0
 
-local function runSerial(jobType: string, a: any, b: any, c: any, d: any, e: any, f: any, g: any, h: any, i: any): any
+local function runSerial(jobType: string, a: any, b: any, c: any, d: any, e: any, f: any, g: any, h: any, i: any, j: any): ...any
 	if jobType == "topology" then
 		return Topology.islands(a, b, c, d, e)
 	elseif jobType == "boxer" then
 		return Boxer.decompose(a, b, c, d)
 	elseif jobType == "stress" then
-		return Stress.unsupported(a, b, c, d, e, f, g, h, i)
+		return Stress.unsupported(a, b, c, d, e, f, g, h, i, j)
 	end
 	error(`unknown job type {jobType}`)
 end
@@ -1839,11 +2691,11 @@ function Workers.start(config: any)
 	reply = Instance.new("BindableEvent")
 	reply.Name = "Reply"
 	reply.Parent = folder
-	reply.Event:Connect(function(jobId: number, result: any)
+	reply.Event:Connect(function(jobId: number, ...: any)
 		local callback = pending[jobId]
 		if callback then
 			pending[jobId] = nil
-			callback(result)
+			callback(...)
 		end
 	end)
 
@@ -1872,9 +2724,10 @@ function Workers.start(config: any)
 	folder.Parent = ServerScriptService
 end
 
--- Dispatches a job; callback runs on the main thread with the result.
+-- Dispatches a job; callback runs on the main thread with the result(s) -
+-- multi-return jobs (stress: broken, warnings) pass through both paths.
 -- Serial mode computes inline (callback still async-shaped for callers).
-function Workers.dispatch(jobType: string, callback: (any) -> (), ...: any)
+function Workers.dispatch(jobType: string, callback: (...any) -> (), ...: any)
 	if not parallel or #actors == 0 then
 		callback(runSerial(jobType, ...))
 		return
@@ -1914,20 +2767,22 @@ local Topology = require(package._Patterns.Topology)
 local Boxer = require(package._Patterns.Boxer)
 local Stress = require(package._Patterns.Stress)
 
-actor:BindToMessageParallel("ChunkrJob", function(jobId: number, jobType: string, a, b, c, d, e, f, g, h, i)
-	local result
+actor:BindToMessageParallel("ChunkrJob", function(jobId: number, jobType: string, a, b, c, d, e, f, g, h, i, j)
 	if jobType == "topology" then
-		result = Topology.islands(a, b, c, d, e)
+		local islands = Topology.islands(a, b, c, d, e)
+		task.synchronize()
+		reply:Fire(jobId, islands)
 	elseif jobType == "boxer" then
-		result = Boxer.decompose(a, b, c, d)
+		local boxes = Boxer.decompose(a, b, c, d)
+		task.synchronize()
+		reply:Fire(jobId, boxes)
 	elseif jobType == "stress" then
-		result = Stress.unsupported(a, b, c, d, e, f, g, h, i)
+		local broken, warnings = Stress.unsupported(a, b, c, d, e, f, g, h, i, j)
+		task.synchronize()
+		reply:Fire(jobId, broken, warnings)
 	else
 		warn(`[Chunkr] unknown worker job {jobType}`)
-		return
 	end
-	task.synchronize()
-	reply:Fire(jobId, result)
 end)
 ]])
 mod("World", _3, [[
@@ -1942,8 +2797,10 @@ local Materials = require(script.Parent.Parent._Patterns.Materials)
 local Fracture = require(script.Parent.Parent._Patterns.Fracture)
 local Impact = require(script.Parent.Parent._Patterns.Impact)
 local Adopt = require(script.Parent.Parent._Patterns.Adopt)
+local Fire = require(script.Parent.Parent._Patterns.Fire)
 local Bin = require(script.Parent.Parent._Utility.Bin)
 local Raycast = require(script.Parent.Parent._Utility.Raycast)
+local Persist = require(script.Parent.Parent._Utility.Persist)
 local Query = require(script.Parent.Parent._Utility.Query)
 local Grid = require(script.Parent.Parent._Utility.Grid)
 local Events = require(script.Parent.Parent._Utility.Events)
@@ -1996,6 +2853,83 @@ local function boundingSphere(body: Body.Body): (Vector3, number)
 	local extents = Vector3.new(body.volume.sx, body.volume.sy, body.volume.sz) * body.voxelSize
 	local center = body:GetPivot():PointToWorldSpace(extents / 2)
 	return center, extents.Magnitude / 2
+end
+
+-- ---------------------------------------------------------------- building
+
+local function axesAligned(rel: CFrame): boolean
+	return rel.XVector:Dot(Vector3.xAxis) > 0.999
+		and rel.YVector:Dot(Vector3.yAxis) > 0.999
+		and rel.ZVector:Dot(Vector3.zAxis) > 0.999
+end
+
+-- The construction op: stamps a solid box of `materialName`, sized
+-- `sizeStuds`, centred on `cframe`. When the box sits inside an existing
+-- aligned body it merges into that body's volume (repair a wall, extend a
+-- bridge); otherwise a new anchored body spawns. Returns the body touched.
+function World.Build(self: World, cframe: CFrame, sizeStuds: Vector3, materialName: string, voxelSize: number?): Body.Body?
+	local material = Materials.get(materialName)
+	local half = sizeStuds / 2
+
+	for _, body in self.bodies do
+		if body.destroyed or not body.carvable or not body.anchored then
+			continue
+		end
+		if voxelSize and math.abs(voxelSize - body.voxelSize) > 1e-3 then
+			continue
+		end
+		local rel = body:GetPivot():ToObjectSpace(cframe)
+		if not axesAligned(rel) then
+			continue
+		end
+		local vs = body.voxelSize
+		local volume = body.volume
+		local x0 = math.round((rel.Position.X - half.X) / vs)
+		local y0 = math.round((rel.Position.Y - half.Y) / vs)
+		local z0 = math.round((rel.Position.Z - half.Z) / vs)
+		local x1 = math.round((rel.Position.X + half.X) / vs) - 1
+		local y1 = math.round((rel.Position.Y + half.Y) / vs) - 1
+		local z1 = math.round((rel.Position.Z + half.Z) / vs) - 1
+		if
+			x0 >= 0 and y0 >= 0 and z0 >= 0 and x1 >= x0 and y1 >= y0 and z1 >= z0
+			and x1 < volume.sx and y1 < volume.sy and z1 < volume.sz
+		then
+			volume:FillBox(x0, y0, z0, x1, y1, z1, material.id)
+			body._stressDirty = true
+			-- Dirty volume -> next tick's topology confirms one island and
+			-- remeshes; the new voxels weld straight into the assembly.
+			return body
+		end
+	end
+
+	local vs = voxelSize or self.config.build.voxelSize
+	local sx = math.max(1, math.round(sizeStuds.X / vs))
+	local sy = math.max(1, math.round(sizeStuds.Y / vs))
+	local sz = math.max(1, math.round(sizeStuds.Z / vs))
+	if sx * sy * sz > self.config.build.maxVoxels then
+		warn(`[Chunkr] build: {sx}x{sy}x{sz} exceeds build.maxVoxels`)
+		return nil
+	end
+	local volume = Volume.new(sx, sy, sz)
+	volume:FillBox(0, 0, 0, sx - 1, sy - 1, sz - 1, material.id)
+	volume:ClearDirty()
+	local body = Body.fromVolume(volume, {
+		voxelSize = vs,
+		cframe = cframe * CFrame.new(-Vector3.new(sx, sy, sz) * vs / 2),
+		anchored = true,
+	})
+	body.needsRemesh = true
+	return self:Add(body)
+end
+
+-- Stamps a Blueprint into the world as a fresh body (prefab placement).
+function World.Place(self: World, blueprint: Blueprint.Blueprint, cframe: CFrame, anchored: boolean?): Body.Body
+	local body = Body.fromBlueprint(blueprint, {
+		cframe = cframe,
+		anchored = if anchored ~= nil then anchored else true,
+	})
+	body.needsRemesh = true
+	return self:Add(body)
 end
 
 -- ---------------------------------------------------------------- carve ops
@@ -2078,7 +3012,24 @@ function World.Explode(self: World, position: Vector3, radiusStuds: number, powe
 			end
 		end
 	end
+	-- Blasts start fires (parts in reach were already adopted above).
+	local fire = self.config.fire
+	if fire.enabled and fire.igniteFromExplosions then
+		Fire.igniteSphere(self, position, radiusStuds * fire.explosionIgniteScale)
+	end
 	return removed
+end
+
+-- Lights every flammable voxel in the sphere; plain parts in reach are
+-- adopted first, so a wooden shed catches from a torch with zero setup.
+function World.Ignite(self: World, position: Vector3, radiusStuds: number): number
+	if not self.config.fire.enabled then
+		return 0
+	end
+	if self.config.adopt.enabled then
+		Adopt.sweepRadius(self, position, radiusStuds)
+	end
+	return Fire.igniteSphere(self, position, radiusStuds)
 end
 
 function World.CutRay(self: World, origin: Vector3, target: Vector3, thicknessStuds: number, power: number?): number
@@ -2256,6 +3207,19 @@ function World.Reset(self: World, snapshot: Snapshot, parent: Instance?)
 		body.volume.dirty = { minX = 0, minY = 0, minZ = 0, maxX = body.volume.sx - 1, maxY = body.volume.sy - 1, maxZ = body.volume.sz - 1 }
 		self:Add(body)
 	end
+end
+
+-- Chunked DataStore save of the current snapshot (yields). `store` defaults
+-- to a DataStore named config.persist.dataStore; inject your own backend
+-- ({ read, write }) for MemoryStore/external saves/tests.
+function World.Save(self: World, key: string, store: Persist.Store?): number
+	return Persist.save(self, key, store or Persist.datastore(self.config.persist.dataStore))
+end
+
+-- Loads a saved snapshot and resets the world to it (yields). False when
+-- nothing is stored under `key`.
+function World.Load(self: World, key: string, store: Persist.Store?, parent: Instance?): boolean
+	return Persist.load(self, key, store or Persist.datastore(self.config.persist.dataStore), parent)
 end
 
 function World.Destroy(self: World)
@@ -8536,8 +9500,9 @@ mod("Adopt", _12, [[
 -- stay within the config voxel budget (baseplates become coarse voxels
 -- rather than a million fine ones).
 --
--- Limitations (v1): the part's AABB is voxelized as a solid box - wedges,
--- cylinders and unions adopt as their bounding box. Server only.
+-- Shape fidelity: primitive Parts fill analytically (balls round, wedges
+-- sloped); MeshParts/unions raycast-sample their true collision shape when
+-- adopt.meshSampling is on (bounding box past the column budget). Server only.
 
 local CollectionService = game:GetService("CollectionService")
 
@@ -8548,6 +9513,7 @@ local Materials = require(script.Parent.Materials)
 local Fracture = require(script.Parent.Fracture)
 local Boxer = require(script.Parent.Boxer)
 local Bin = require(script.Parent.Parent._Utility.Bin)
+local Shapes = require(script.Parent.Parent._Utility.Shapes)
 
 local Adopt = {}
 
@@ -8559,13 +9525,14 @@ type Preset = {
 	toughness: number,
 	archetype: ("glass" | "stone" | "wood")?,
 	breakMode: Types.BreakMode?,
+	flammability: number?,
 }
 
 local PRESETS: { [Enum.Material]: Preset } = {
 	[Enum.Material.Glass] = { density = 2.5, strength = 1, toughness = 8, archetype = "glass" },
 	[Enum.Material.Ice] = { density = 0.9, strength = 1, toughness = 10, archetype = "glass" },
-	[Enum.Material.Wood] = { density = 0.4, strength = 2, toughness = 50, archetype = "wood", breakMode = "detach" },
-	[Enum.Material.WoodPlanks] = { density = 0.4, strength = 2, toughness = 50, archetype = "wood", breakMode = "detach" },
+	[Enum.Material.Wood] = { density = 0.4, strength = 2, toughness = 50, archetype = "wood", breakMode = "detach", flammability = 0.85 },
+	[Enum.Material.WoodPlanks] = { density = 0.4, strength = 2, toughness = 50, archetype = "wood", breakMode = "detach", flammability = 0.85 },
 	[Enum.Material.Brick] = { density = 1.8, strength = 6, toughness = 120, archetype = "stone" },
 	[Enum.Material.Concrete] = { density = 2.6, strength = 9, toughness = 300, archetype = "stone" },
 	[Enum.Material.Cobblestone] = { density = 2.4, strength = 6, toughness = 150, archetype = "stone" },
@@ -8621,6 +9588,7 @@ local function resolveMaterial(part: BasePart): Types.Material
 		transparency = part.Transparency,
 		reflectance = part.Reflectance,
 		breakMode = preset.breakMode,
+		flammability = preset.flammability,
 		fractureTable = buildTable(preset.archetype, preset.toughness),
 	})
 end
@@ -8648,34 +9616,84 @@ function Adopt.eligible(part: Instance): boolean
 	return true
 end
 
--- Shape-aware fill predicate: voxel centre (px,py,pz) in part-local studs,
--- `half` = part.Size/2. Balls voxelize round, cylinders round-along-X,
--- wedges sloped; everything else fills its box.
-local function occupied(part: BasePart, px: number, py: number, pz: number, half: Vector3): boolean
-	-- Rounded dims can overhang the true size by half a voxel; trim to size.
-	if math.abs(px) > half.X or math.abs(py) > half.Y or math.abs(pz) > half.Z then
-		return false
-	end
-	if part:IsA("Part") then
-		local shape = part.Shape
-		if shape == Enum.PartType.Ball then
-			local radius = math.min(half.X, half.Y, half.Z)
-			return px * px + py * py + pz * pz <= radius * radius
-		elseif shape == Enum.PartType.Cylinder then
-			-- Roblox cylinders lie along X.
-			local radius = math.min(half.Y, half.Z)
-			return py * py + pz * pz <= radius * radius
-		elseif shape == Enum.PartType.Wedge then
-			return (py + half.Y) / (half.Y * 2) <= (pz + half.Z) / (half.Z * 2)
-		elseif shape == Enum.PartType.CornerWedge then
-			local yFrac = (py + half.Y) / (half.Y * 2)
-			return yFrac <= (px + half.X) / (half.X * 2) and yFrac <= (half.Z - pz) / (half.Z * 2)
+-- Shape-aware fill lives in _Utility/Shapes: balls voxelize round, cylinders
+-- round-along-X, wedges sloped; everything else fills its box. (Rounded voxel
+-- dims can overhang the true size by half a voxel; Shapes trims to size.)
+
+-- ------------------------------------------------------------ mesh sampling
+-- MeshParts/unions sample their TRUE collision shape: per (x,z) column, a
+-- downward ray marches the span TOPS and an upward ray marches the span
+-- BOTTOMS (rays never hit backfaces of the hulls they start inside, so each
+-- direction sees exactly one side of every solid span). Sorted and paired,
+-- the spans fill the column - concave unions with holes come out right.
+-- Falls back to the bounding box past the column budget.
+
+local MAX_MARCH = 16
+
+-- Ray-marches all surface crossings, returning their part-local Y values.
+local function marchColumn(part: BasePart, origin: Vector3, direction: Vector3, length: number, params: RaycastParams, out: { number })
+	table.clear(out)
+	local remaining = length
+	local from = origin
+	for _ = 1, MAX_MARCH do
+		if remaining <= 0 then
+			break
 		end
-		return true -- Block
-	elseif part:IsA("WedgePart") then
-		return (py + half.Y) / (half.Y * 2) <= (pz + half.Z) / (half.Z * 2)
+		local hit = workspace:Raycast(from, direction * remaining, params)
+		if not hit then
+			break
+		end
+		table.insert(out, part.CFrame:PointToObjectSpace(hit.Position).Y)
+		local step = (hit.Position - from).Magnitude + 0.01
+		from += direction * step
+		remaining -= step
 	end
-	return true -- MeshPart/unions/etc: bounding box (v1)
+end
+
+local function meshFill(part: BasePart, volume: Volume.Volume, materialId: number, voxelSize: number, originOffset: Vector3, sx: number, sy: number, sz: number)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Include
+	params.FilterDescendantsInstances = { part }
+
+	local cf = part.CFrame
+	local half = part.Size / 2
+	local margin = voxelSize
+	local length = half.Y * 2 + margin * 2
+	local down = -cf.YVector
+	local up = cf.YVector
+	local tops: { number } = {}
+	local bottoms: { number } = {}
+
+	for z = 0, sz - 1 do
+		for x = 0, sx - 1 do
+			local lx = (x + 0.5) * voxelSize - originOffset.X
+			local lz = (z + 0.5) * voxelSize - originOffset.Z
+			marchColumn(part, cf:PointToWorldSpace(Vector3.new(lx, half.Y + margin, lz)), down, length, params, tops)
+			if #tops == 0 then
+				continue
+			end
+			marchColumn(part, cf:PointToWorldSpace(Vector3.new(lx, -half.Y - margin, lz)), up, length, params, bottoms)
+			table.sort(tops)
+			table.sort(bottoms)
+			local spans = math.min(#tops, #bottoms)
+			for s = 1, spans do
+				local bottom, top = bottoms[s], tops[s]
+				-- Thin shells still deserve their surface voxel.
+				local y0 = math.floor((bottom + originOffset.Y) / voxelSize)
+				local y1 = math.ceil((top + originOffset.Y) / voxelSize) - 1
+				if y1 < y0 then
+					y0 = math.clamp(math.round(((bottom + top) / 2 + originOffset.Y) / voxelSize - 0.5), 0, sy - 1)
+					y1 = y0
+				end
+				for y = math.max(0, y0), math.min(sy - 1, y1) do
+					local centreY = (y + 0.5) * voxelSize - originOffset.Y
+					if centreY >= bottom - voxelSize * 0.5 and centreY <= top + voxelSize * 0.5 then
+						volume:Set(x, y, z, materialId)
+					end
+				end
+			end
+		end
+	end
 end
 
 -- Voxelizes one part into a Body (solid box at inferred resolution),
@@ -8723,15 +9741,23 @@ function Adopt.part(world: any, part: BasePart): Body.Body?
 	local material = resolveMaterial(part)
 	local volume = Volume.new(sx, sy, sz)
 	local half = size / 2
+	local kind = Shapes.kind(part)
 	local originOffset = Vector3.new(sx, sy, sz) * voxelSize / 2
-	for y = 0, sy - 1 do
-		for z = 0, sz - 1 do
-			for x = 0, sx - 1 do
-				local px = (x + 0.5) * voxelSize - originOffset.X
-				local py = (y + 0.5) * voxelSize - originOffset.Y
-				local pz = (z + 0.5) * voxelSize - originOffset.Z
-				if occupied(part, px, py, pz, half) then
-					volume:Set(x, y, z, material.id)
+	local meshy = (part:IsA("MeshPart") or part:IsA("PartOperation"))
+		and cfg.meshSampling
+		and sx * sz <= cfg.meshColumnBudget
+	if meshy then
+		meshFill(part, volume, material.id, voxelSize, originOffset, sx, sy, sz)
+	else
+		for y = 0, sy - 1 do
+			for z = 0, sz - 1 do
+				for x = 0, sx - 1 do
+					local px = (x + 0.5) * voxelSize - originOffset.X
+					local py = (y + 0.5) * voxelSize - originOffset.Y
+					local pz = (z + 0.5) * voxelSize - originOffset.Z
+					if Shapes.contains(kind, px, py, pz, half) then
+						volume:Set(x, y, z, material.id)
+					end
 				end
 			end
 		end
@@ -9153,6 +10179,237 @@ function Debris.selectDespawn(entries: { BodyEntry }, config: DebrisConfig): { a
 end
 
 return Debris
+]])
+mod("Fire", _12, [[
+-- Fire: flammability-driven voxel fire. Burning voxels consume their fuel
+-- over a few seconds, spread to flammable neighbours (fire climbs - upward
+-- spread is likelier), then burn away. Burnt voxels are plain deletions, so
+-- the existing pipeline does the rest: Topology drops the pieces a burnt
+-- floor no longer connects, stress pancakes what the fire hollowed out.
+--
+-- Material `flammability` (0..1, default 0) is the whole knob: 0 never
+-- burns, higher spreads faster. Adopted wood parts get it automatically.
+--
+--   world:Ignite(position, radiusStuds)   -- (adopts plain parts, then lights)
+--   Explosions auto-ignite their blast radius when config.fire.igniteFromExplosions.
+--
+-- Events: OnIgnite(body, count, position) on new ignitions,
+-- OnBurn(body, burningCount, position) every fire tick while burning,
+-- OnBurnout(body, burnedCount, position) when voxels burn away.
+--
+-- v1 notes: fire state lives on the body's current volume - splits and
+-- replacements extinguish it (the fragments' fire doesn't follow them).
+-- Server only, ticked from Simulation.
+
+local Materials = require(script.Parent.Materials)
+local Body = require(script.Parent.Parent._Classes.Body)
+local Events = require(script.Parent.Parent._Utility.Events)
+
+local Fire = {}
+
+local NEIGHBOURS = {
+	{ 1, 0, 0 },
+	{ -1, 0, 0 },
+	{ 0, 1, 0 },
+	{ 0, -1, 0 },
+	{ 0, 0, 1 },
+	{ 0, 0, -1 },
+}
+
+local function flammabilityLut(): { [number]: number }
+	local lut = {}
+	for id, material in Materials.all() do
+		lut[id] = material.flammability
+	end
+	return lut
+end
+
+local function freshFuel(cfg: any): number
+	return cfg.burnSeconds * (0.7 + math.random() * 0.6)
+end
+
+local function stateFor(body: Body.Body): Body.FireState
+	local state = body._fire
+	if state and state.volume == body.volume then
+		return state
+	end
+	state = {
+		volume = body.volume,
+		burning = {},
+		count = 0,
+		lastTick = os.clock(),
+	}
+	body._fire = state
+	return state
+end
+
+-- Lights every flammable solid voxel of `body` within the world-space
+-- sphere. Returns how many caught.
+function Fire.ignite(cfg: any, body: Body.Body, position: Vector3, radiusStuds: number): number
+	if body.destroyed or not body.carvable then
+		return 0
+	end
+	local volume = body.volume
+	local vx, vy, vz = body:WorldToLocal(position)
+	local r = radiusStuds / body.voxelSize
+	local x0 = math.max(0, math.floor(vx - r))
+	local y0 = math.max(0, math.floor(vy - r))
+	local z0 = math.max(0, math.floor(vz - r))
+	local x1 = math.min(volume.sx - 1, math.ceil(vx + r))
+	local y1 = math.min(volume.sy - 1, math.ceil(vy + r))
+	local z1 = math.min(volume.sz - 1, math.ceil(vz + r))
+	if x0 > x1 or y0 > y1 or z0 > z1 then
+		return 0
+	end
+
+	local lut = flammabilityLut()
+	local state = stateFor(body)
+	local sx, sxsz = volume.sx, volume.sx * volume.sz
+	local rr = r * r
+	local ignited = 0
+	for y = y0, y1 do
+		for z = z0, z1 do
+			for x = x0, x1 do
+				local dx, dy, dz = x + 0.5 - vx, y + 0.5 - vy, z + 0.5 - vz
+				if dx * dx + dy * dy + dz * dz > rr then
+					continue
+				end
+				local id = volume:Get(x, y, z)
+				if id == 0 or (lut[id] or 0) <= 0 then
+					continue
+				end
+				local index = x + z * sx + y * sxsz
+				if not state.burning[index] and state.count < cfg.maxBurningPerBody then
+					state.burning[index] = freshFuel(cfg)
+					state.count += 1
+					ignited += 1
+				end
+			end
+		end
+	end
+	if ignited > 0 then
+		Events.OnIgnite:Fire(body, ignited, position)
+	end
+	return ignited
+end
+
+-- Lights everything flammable in a world-space sphere across all bodies.
+function Fire.igniteSphere(world: any, position: Vector3, radiusStuds: number): number
+	local cfg = world.config.fire
+	local ignited = 0
+	for _, body in world:Bodies() do
+		local volume = body.volume
+		local dims = Vector3.new(volume.sx, volume.sy, volume.sz) * body.voxelSize
+		local centre = body:GetPivot():PointToWorldSpace(dims / 2)
+		if (centre - position).Magnitude <= dims.Magnitude / 2 + radiusStuds then
+			ignited += Fire.ignite(cfg, body, position, radiusStuds)
+		end
+	end
+	return ignited
+end
+
+-- One simulation-tick's worth of fire: per burning body (on its own fire
+-- clock), burn fuel down, delete burnt voxels, spread to neighbours.
+function Fire.step(world: any)
+	local cfg = world.config.fire
+	local lut = flammabilityLut()
+	local now = os.clock()
+
+	for _, body in world:Bodies() do
+		local state = body._fire
+		if not state or body.destroyed then
+			continue
+		end
+		-- Splits/replacements swap the volume out from under the indices.
+		if state.volume ~= body.volume then
+			body._fire = nil
+			continue
+		end
+		local elapsed = now - state.lastTick
+		if elapsed < cfg.tickInterval then
+			continue
+		end
+		state.lastTick = now
+		elapsed = math.min(elapsed, cfg.tickInterval * 3) -- hitch guard
+
+		local volume = state.volume
+		local sx, sy, sz = volume.sx, volume.sy, volume.sz
+		local sxsz = sx * sz
+		local burned = 0
+		local burnedX, burnedY, burnedZ = 0, 0, 0
+		local sampleX, sampleY, sampleZ = -1, 0, 0
+		local remove: { number } = {}
+		local spread: { number } = {}
+
+		for index, fuel in state.burning do
+			local x = index % sx
+			local y = index // sxsz
+			local z = (index // sx) % sz
+			if volume:Get(x, y, z) == 0 then
+				table.insert(remove, index) -- carved away under the fire
+				continue
+			end
+			sampleX, sampleY, sampleZ = x, y, z
+			fuel -= elapsed
+			if fuel <= 0 then
+				volume:Set(x, y, z, 0)
+				burned += 1
+				burnedX, burnedY, burnedZ = x, y, z
+				table.insert(remove, index)
+				continue
+			end
+			state.burning[index] = fuel
+			for _, dir in NEIGHBOURS do
+				local nx, ny, nz = x + dir[1], y + dir[2], z + dir[3]
+				if nx < 0 or ny < 0 or nz < 0 or nx >= sx or ny >= sy or nz >= sz then
+					continue
+				end
+				local id = volume:Get(nx, ny, nz)
+				local flam = if id ~= 0 then lut[id] or 0 else 0
+				if flam <= 0 then
+					continue
+				end
+				-- Fire climbs: upward spread is favoured, downward damped.
+				local chance = flam * cfg.spreadChance * (if dir[2] == 1 then 1.5 elseif dir[2] == -1 then 0.5 else 1)
+				if math.random() < chance then
+					local nindex = nx + nz * sx + ny * sxsz
+					if not state.burning[nindex] then
+						table.insert(spread, nindex)
+					end
+				end
+			end
+		end
+
+		for _, index in remove do
+			if state.burning[index] ~= nil then
+				state.burning[index] = nil
+				state.count -= 1
+			end
+		end
+		for _, index in spread do
+			if not state.burning[index] and state.count < cfg.maxBurningPerBody then
+				state.burning[index] = freshFuel(cfg)
+				state.count += 1
+			end
+		end
+
+		if burned > 0 then
+			if body.anchored then
+				body._stressDirty = true
+			end
+			Events.OnBurnout:Fire(body, burned, body:LocalToWorld(burnedX, burnedY, burnedZ))
+		end
+		if state.count > 0 then
+			if sampleX >= 0 then
+				Events.OnBurn:Fire(body, state.count, body:LocalToWorld(sampleX, sampleY, sampleZ))
+			end
+		else
+			body._fire = nil
+		end
+	end
+end
+
+return Fire
 ]])
 local _13 = mod("Fracture", _12, [[
 -- Fracture pattern application: FractureEvent in, cracks stamped, done.
@@ -9879,18 +11136,45 @@ mod("Splinter", _12, [[
 -- want the real engine. (Splintered pieces are still plain parts, so heavy
 -- destruction ops can adopt them afterwards.)
 --
---   Splinter.hitbox({ shape = "Ball"|"Box", cframe = CFrame, size = Vector3,
---       minimumVoxelSize = 1, timeToReset = 10, unanchor = false,
---   }) -> { BasePart }        -- the voxel parts inside the region
---   Splinter.part(part, minimumVoxelSize, timeToReset) -> { BasePart }
---   Splinter.cutInHalf(part) -> { BasePart } (two halves, longest axis)
+-- Every operation returns a Splint handle:
+--   local splint = Splinter.hitbox({ shape = "Ball"|"Box", cframe = CFrame,
+--       size = Vector3, minimumVoxelSize = 1, timeToReset = 10,
+--       unanchor = false, kick = 20 })
+--   splint.voxels        -- captured voxel Parts (inside the region), grouped
+--                        -- in splint.model under Workspace/_Bin/Voxels
+--   splint:GetChunks()   -- surviving pieces of the original instance(s) that
+--                        -- were NOT captured (the rest of the wall)
+--   splint:GetVoxels()   -- captured voxels still alive
+--   splint:GetRemnants() -- everything still alive derived from the originals
+--   splint:Unanchor(kick?)  splint:Restore()
+--
+--   Splinter.part(part, minimumVoxelSize?, timeToReset?, unanchor?) -> Splint
+--   Splinter.cutInHalf(part, timeToReset?) -> { BasePart }
+--   Splinter.attach({ follow = blade, size = ..., interval = 0.1, ... })
+--       -> moveable Hitbox: welded to a part (or driven via :SetCFrame),
+--       sweeps every `interval` seconds while started; OnSplinter fires with
+--       each Splint that captured voxels. Start/Stop/Sweep/Destroy.
+--   Splinter.restore(id) / Splinter.restoreAll()
+--   Splinter.pieces(part) -> (voxels, chunks) for the record `part` belongs to
+--   Splinter.idOf(part) / Splinter.isVoxel(part)
+--
+-- Shape-aware: Ball/Cylinder/Wedge/CornerWedge parts subdivide to their true
+-- shape - pieces outside the shape are dropped, the surface refines to the
+-- minimum voxel size, interior pieces stay as large chunks. Children of
+-- shaped/mesh parts are emitted as Block parts (never scaled clones of the
+-- shape). Very large shaped parts degrade to boxy pieces at the part budget.
+--
+-- Reset timers slide: re-hitting a part before its reset pushes the deadline
+-- back out to the newest timeToReset. timeToReset <= 0 or nil = permanent.
 --
 -- Eligibility follows adoption's rules (ChunkrIgnore opts out, characters/
--- Terrain/Chunkr bodies never split). timeToReset <= 0 or nil = permanent.
--- Server only.
+-- Terrain/Chunkr bodies never split). Server only.
 
 local CollectionService = game:GetService("CollectionService")
+local RunService = game:GetService("RunService")
 
+local Signal = require(script.Parent.Parent._Packages.Signal)
+local Shapes = require(script.Parent.Parent._Utility.Shapes)
 local Adopt = require(script.Parent.Adopt)
 local Bin = require(script.Parent.Parent._Utility.Bin)
 
@@ -9914,51 +11198,119 @@ export type HitboxOptions = {
 	minimumVoxelSize: number?,
 	timeToReset: number?,
 	unanchor: boolean?,
+	-- Radial fling speed (studs/s) applied to unanchored voxels, away from
+	-- the region centre with a bit of lift. Requires unanchor.
+	kick: number?,
 	params: OverlapParams?,
+}
+
+export type AttachOptions = {
+	-- The hitbox follows this part every sweep (cframe = follow.CFrame *
+	-- offset). Omit `follow` to drive the pose manually via :SetCFrame.
+	follow: BasePart?,
+	offset: CFrame?,
+	cframe: CFrame?,
+	shape: ("Ball" | "Box")?,
+	size: Vector3,
+	minimumVoxelSize: number?,
+	timeToReset: number?,
+	unanchor: boolean?,
+	kick: number?,
+	params: OverlapParams?,
+	-- Seconds between sweeps while started (default 0.1).
+	interval: number?,
+	-- Start sweeping immediately (default true).
+	autoStart: boolean?,
 }
 
 -- ---------------------------------------------------------------- records
 -- One record per original part; every derived piece joins it so reset can
--- sweep them all and restore the pristine clone.
+-- sweep them all and restore the pristine clone. The original's shape is
+-- captured up front (the part dies during subdivision).
+
+type Shape = {
+	kind: Shapes.Kind,
+	cframe: CFrame,
+	half: Vector3,
+}
 
 type Record = {
+	id: number,
 	clone: BasePart,
 	parent: Instance?,
-	parts: { [BasePart]: boolean },
+	parts: { [BasePart]: boolean }, -- every surviving derived piece
+	voxels: { [BasePart]: boolean }, -- subset: captured voxels
+	models: { [Model]: boolean }, -- op containers holding this record's voxels
+	shape: Shape,
+	resetAt: number?, -- sliding restore deadline (os.clock)
+	timerRunning: boolean,
 }
 
 local records: { [number]: Record } = {}
-local nextId = 0
+local nextRecordId = 0
+local nextOpId = 0
 
-local function recordFor(part: BasePart, timeToReset: number?): number
-	local existing = part:GetAttribute(ID_ATTRIBUTE)
-	if type(existing) == "number" and records[existing] then
-		return existing
+local function startTimer(record: Record)
+	if record.timerRunning then
+		return
 	end
-	nextId += 1
-	local id = nextId
-	local clone = part:Clone()
-	clone:SetAttribute(ID_ATTRIBUTE, nil)
-	records[id] = {
-		clone = clone,
-		parent = part.Parent,
-		parts = {},
-	}
+	record.timerRunning = true
+	task.spawn(function()
+		while records[record.id] == record and record.resetAt do
+			local remaining = record.resetAt - os.clock()
+			if remaining <= 0 then
+				Splinter.restore(record.id)
+				break
+			end
+			task.wait(remaining)
+		end
+	end)
+end
+
+local function recordFor(part: BasePart, timeToReset: number?): Record
+	local existingId = part:GetAttribute(ID_ATTRIBUTE)
+	local record = if type(existingId) == "number" then records[existingId] else nil
+	if not record then
+		nextRecordId += 1
+		local clone = part:Clone()
+		clone:SetAttribute(ID_ATTRIBUTE, nil)
+		CollectionService:RemoveTag(clone, Splinter.VOXEL_TAG)
+		record = {
+			id = nextRecordId,
+			clone = clone,
+			parent = part.Parent,
+			parts = {},
+			voxels = {},
+			models = {},
+			shape = {
+				kind = Shapes.kind(part),
+				cframe = part.CFrame,
+				half = part.Size / 2,
+			},
+			resetAt = nil,
+			timerRunning = false,
+		}
+		records[nextRecordId] = record
+	end
 	if timeToReset and timeToReset > 0 then
-		task.delay(timeToReset, function()
-			Splinter.restore(id)
-		end)
+		-- Sliding deadline: re-hits push the reset out, never pull it in.
+		local deadline = os.clock() + timeToReset
+		if not record.resetAt or deadline > record.resetAt then
+			record.resetAt = deadline
+		end
+		startTimer(record)
 	end
-	return id
+	return record
 end
 
-local function register(id: number, part: BasePart)
-	part:SetAttribute(ID_ATTRIBUTE, id)
-	records[id].parts[part] = true
+local function register(record: Record, part: BasePart)
+	part:SetAttribute(ID_ATTRIBUTE, record.id)
+	record.parts[part] = true
 end
 
-local function unregister(id: number, part: BasePart)
-	records[id].parts[part] = nil
+local function unregister(record: Record, part: BasePart)
+	record.parts[part] = nil
+	record.voxels[part] = nil
 end
 
 -- Destroys every surviving derived piece and restores the original part.
@@ -9973,9 +11325,53 @@ function Splinter.restore(id: number)
 			part:Destroy()
 		end
 	end
+	for model in record.models do
+		if model.Parent and #model:GetChildren() == 0 then
+			model:Destroy()
+		end
+	end
 	if record.parent and record.parent.Parent then
 		record.clone.Parent = record.parent
 	end
+end
+
+-- Restores every active record (server cleanup / round reset).
+function Splinter.restoreAll()
+	local ids = {}
+	for id in records do
+		table.insert(ids, id)
+	end
+	for _, id in ids do
+		Splinter.restore(id)
+	end
+end
+
+-- Record id a part belongs to (original or any derived piece), if any.
+function Splinter.idOf(part: Instance): number?
+	local id = part:GetAttribute(ID_ATTRIBUTE)
+	return if type(id) == "number" and records[id] ~= nil then id else nil
+end
+
+-- All surviving pieces of the record `part` belongs to, split into captured
+-- voxels and uncaptured chunks. Nil when the part was never splintered.
+function Splinter.pieces(part: BasePart): ({ BasePart }?, { BasePart }?)
+	local id = Splinter.idOf(part)
+	if not id then
+		return nil, nil
+	end
+	local record = records[id]
+	local voxels, chunks = {}, {}
+	for piece in record.parts do
+		if piece.Parent then
+			table.insert(if record.voxels[piece] then voxels else chunks, piece)
+		end
+	end
+	return voxels, chunks
+end
+
+-- Is this a captured splinter voxel?
+function Splinter.isVoxel(part: Instance): boolean
+	return CollectionService:HasTag(part, Splinter.VOXEL_TAG)
 end
 
 -- ---------------------------------------------------------------- geometry
@@ -9998,25 +11394,221 @@ local function overlaps(region: Region, part: BasePart): boolean
 	return (localPos - clamped).Magnitude <= partRadius
 end
 
+-- Where does this piece sit relative to the original part's shape?
+-- 1 = fully inside, -1 = fully outside, 0 = crossing the surface.
+-- Derived pieces share the original's orientation, so the 8 corners are
+-- simple offsets in the original's local space. Exact for convex shapes.
+local function classify(shape: Shape, position: Vector3, size: Vector3): number
+	if shape.kind == "Block" then
+		return 1
+	end
+	local rel = shape.cframe:PointToObjectSpace(position)
+	local h = size / 2
+	local inside = 0
+	for ix = -1, 1, 2 do
+		for iy = -1, 1, 2 do
+			for iz = -1, 1, 2 do
+				if Shapes.contains(shape.kind, rel.X + ix * h.X, rel.Y + iy * h.Y, rel.Z + iz * h.Z, shape.half) then
+					inside += 1
+				end
+			end
+		end
+	end
+	local centreIn = Shapes.contains(shape.kind, rel.X, rel.Y, rel.Z, shape.half)
+	if inside == 8 and centreIn then
+		return 1
+	elseif inside == 0 and not centreIn then
+		return -1
+	end
+	return 0
+end
+
+local function containsCentre(shape: Shape, position: Vector3): boolean
+	if shape.kind == "Block" then
+		return true
+	end
+	local rel = shape.cframe:PointToObjectSpace(position)
+	return Shapes.contains(shape.kind, rel.X, rel.Y, rel.Z, shape.half)
+end
+
 -- ---------------------------------------------------------------- division
 
-local function makeVoxel(part: BasePart)
+-- A derived piece: always a Block Part with the source's appearance. Shaped
+-- parts must not clone as scaled balls/wedges, and clones must not drag
+-- joints/scripts (or a stale voxel tag) along.
+local function blockCopy(part: BasePart): BasePart
+	local child: BasePart
+	if part:IsA("Part") then
+		local clone = part:Clone()
+		clone.Shape = Enum.PartType.Block
+		CollectionService:RemoveTag(clone, Splinter.VOXEL_TAG)
+		for _, inner in clone:GetDescendants() do
+			if inner:IsA("JointInstance") or inner:IsA("Constraint") or inner:IsA("LuaSourceContainer") then
+				inner:Destroy()
+			end
+		end
+		child = clone
+	else
+		local fresh = Instance.new("Part")
+		fresh.Name = part.Name
+		fresh.Color = part.Color
+		fresh.Material = part.Material
+		fresh.MaterialVariant = part.MaterialVariant
+		fresh.Transparency = part.Transparency
+		fresh.Reflectance = part.Reflectance
+		fresh.CastShadow = part.CastShadow
+		fresh.Anchored = part.Anchored
+		fresh.CanCollide = part.CanCollide
+		fresh.CanTouch = part.CanTouch
+		fresh.CanQuery = part.CanQuery
+		fresh.CollisionGroup = part.CollisionGroup
+		fresh.CustomPhysicalProperties = part.CustomPhysicalProperties
+		for key, value in part:GetAttributes() do
+			fresh:SetAttribute(key, value)
+		end
+		child = fresh
+	end
+	return child
+end
+
+-- ---------------------------------------------------------------- splints
+-- The per-operation result handle. Captured voxels live in `model` under
+-- Workspace/_Bin/Voxels; chunks stay where the original stood.
+
+local Splint = {}
+Splint.__index = Splint
+
+export type Splint = typeof(setmetatable(
+	{} :: {
+		id: number,
+		region: Region,
+		model: Model?,
+		voxels: { BasePart },
+		-- Pristine unparented copies of the affected originals (templates
+		-- used by Restore; treat as read-only).
+		originals: { BasePart },
+		_records: { [number]: boolean },
+	},
+	Splint
+))
+
+local function newSplint(region: Region): Splint
+	nextOpId += 1
+	return setmetatable({
+		id = nextOpId,
+		region = region,
+		model = nil :: Model?,
+		voxels = {},
+		originals = {},
+		_records = {},
+	}, Splint)
+end
+
+-- Captured voxels of THIS operation still alive.
+function Splint.GetVoxels(self: Splint): { BasePart }
+	local out = {}
+	for _, voxel in self.voxels do
+		if voxel.Parent then
+			table.insert(out, voxel)
+		end
+	end
+	return out
+end
+
+-- Surviving pieces of the original instance(s) that were NOT captured by
+-- the region - the rest of the wall, still standing where it was.
+function Splint.GetChunks(self: Splint): { BasePart }
+	local out = {}
+	for id in self._records do
+		local record = records[id]
+		if record then
+			for piece in record.parts do
+				if piece.Parent and not record.voxels[piece] then
+					table.insert(out, piece)
+				end
+			end
+		end
+	end
+	return out
+end
+
+-- Everything still alive derived from the affected originals (captured or
+-- not, this operation or an earlier one).
+function Splint.GetRemnants(self: Splint): { BasePart }
+	local out = {}
+	for id in self._records do
+		local record = records[id]
+		if record then
+			for piece in record.parts do
+				if piece.Parent then
+					table.insert(out, piece)
+				end
+			end
+		end
+	end
+	return out
+end
+
+-- Unanchors this operation's voxels; `kick` flings them from the region
+-- centre (studs/s) with a bit of lift.
+function Splint.Unanchor(self: Splint, kick: number?)
+	local centre = self.region.cframe.Position
+	for _, voxel in self.voxels do
+		if voxel.Parent then
+			voxel.Anchored = false
+			if kick and kick > 0 then
+				local dir = voxel.Position - centre
+				dir = if dir.Magnitude > 1e-3 then dir.Unit else Vector3.yAxis
+				voxel.AssemblyLinearVelocity = dir * kick + Vector3.new(0, kick * 0.35, 0)
+			end
+		end
+	end
+end
+
+-- Restores every original this operation touched, right now.
+function Splint.Restore(self: Splint)
+	for id in self._records do
+		Splinter.restore(id)
+	end
+end
+
+-- Voxels captured by an op are tagged, grouped into the op's Model under
+-- _Bin/Voxels, and joined to both the record and the splint.
+local function capture(splint: Splint, record: Record, part: BasePart)
 	CollectionService:AddTag(part, Splinter.VOXEL_TAG)
+	local model = splint.model
+	if not model then
+		model = Instance.new("Model")
+		model.Name = `Splint_{splint.id}`
+		model:SetAttribute(ID_ATTRIBUTE, splint.id)
+		model.Parent = Bin.voxels()
+		splint.model = model
+	end
+	part.Parent = model
+	record.models[model :: Model] = true
+	record.voxels[part] = true
+	table.insert(splint.voxels, part)
 end
 
 -- Recursively halve `part` along axes that can still shrink toward
--- minimumVoxelSize, descending only into pieces overlapping the region.
--- Leaves overlapping the region are the "hit" voxels collected in `out`.
-local function subdivide(id: number, part: BasePart, region: Region, minSize: number, out: { BasePart }, budget: { count: number })
+-- minimumVoxelSize. Recursion descends into pieces overlapping the region
+-- (the cut) and pieces crossing the original's shape surface (so shaped
+-- parts refine to their true silhouette). Pieces outside the shape are
+-- dropped; leaves overlapping the region are captured as voxels.
+local function subdivide(splint: Splint, record: Record, part: BasePart, region: Region, minSize: number, budget: { count: number })
 	local size = part.Size
 	local splitX = size.X / 2 >= minSize
 	local splitY = size.Y / 2 >= minSize
 	local splitZ = size.Z / 2 >= minSize
 
 	if (not (splitX or splitY or splitZ)) or budget.count >= MAX_PARTS_PER_OP then
-		-- Terminal voxel.
-		makeVoxel(part)
-		table.insert(out, part)
+		-- Terminal piece: shaped surfaces keep only centre-inside leaves.
+		if not containsCentre(record.shape, part.Position) then
+			unregister(record, part)
+			part:Destroy()
+		elseif overlaps(region, part) then
+			capture(splint, record, part)
+		end
 		return
 	end
 
@@ -10030,28 +11622,42 @@ local function subdivide(id: number, part: BasePart, region: Region, minSize: nu
 					(iy - (counts.Y - 1) / 2) * childSize.Y,
 					(iz - (counts.Z - 1) / 2) * childSize.Z
 				)
-				local child = part:Clone()
-				child.Size = childSize
-				child.CFrame = part.CFrame * CFrame.new(offset)
-				child.Parent = part.Parent
-				register(id, child)
-				budget.count += 1
-				if overlaps(region, child) then
-					subdivide(id, child, region, minSize, out, budget)
+				local childCFrame = part.CFrame * CFrame.new(offset)
+				local cls = classify(record.shape, childCFrame.Position, childSize)
+				if cls < 0 then
+					continue -- outside the original's shape: never existed
 				end
-				-- Non-overlapping children stay as larger chunks.
+				local child = blockCopy(part)
+				child.Size = childSize
+				child.CFrame = childCFrame
+				child.Parent = part.Parent
+				register(record, child)
+				budget.count += 1
+				if overlaps(region, child) or cls == 0 then
+					subdivide(splint, record, child, region, minSize, budget)
+				end
+				-- Fully-inside children off the region stay as larger chunks.
 			end
 		end
 	end
-	unregister(id, part)
+	unregister(record, part)
 	part:Destroy()
+end
+
+local function splinterInto(splint: Splint, part: BasePart, region: Region, minSize: number, timeToReset: number?, budget: { count: number })
+	local record = recordFor(part, timeToReset)
+	splint._records[record.id] = true
+	table.insert(splint.originals, record.clone)
+	register(record, part)
+	subdivide(splint, record, part, region, minSize, budget)
 end
 
 -- ---------------------------------------------------------------- API
 
--- One-shot hitbox: subdivides every eligible part intersecting the region
--- and returns the voxel parts inside it.
-function Splinter.hitbox(options: HitboxOptions): { BasePart }
+-- One-shot hitbox: subdivides every eligible part intersecting the region;
+-- the returned Splint carries the captured voxels (grouped in a Model under
+-- _Bin/Voxels) and can fetch the uncaptured chunks or restore early.
+function Splinter.hitbox(options: HitboxOptions): Splint
 	local region: Region = {
 		shape = options.shape or "Box",
 		cframe = options.cframe,
@@ -10077,59 +11683,172 @@ function Splinter.hitbox(options: HitboxOptions): { BasePart }
 		candidates = workspace:GetPartBoundsInBox(region.cframe, region.size, params)
 	end
 
-	local out: { BasePart } = {}
+	local splint = newSplint(region)
 	local budget = { count = 0 }
 	for _, part in candidates do
 		if Adopt.eligible(part) or part:GetAttribute(ID_ATTRIBUTE) ~= nil then
-			local id = recordFor(part, options.timeToReset)
-			register(id, part)
-			subdivide(id, part, region, minSize, out, budget)
+			splinterInto(splint, part, region, minSize, options.timeToReset, budget)
 		end
 	end
 
 	if options.unanchor then
-		local voxelsFolder = Bin.voxels()
-		for _, voxel in out do
-			voxel.Anchored = false
-			voxel.Parent = voxelsFolder
-		end
+		splint:Unanchor(options.kick)
 	end
-	return out
+	return splint
 end
 
 -- Divides one whole part down to the minimum voxel size (its own bounds are
--- the region, so every leaf is a voxel).
-function Splinter.part(part: BasePart, minimumVoxelSize: number?, timeToReset: number?): { BasePart }
+-- the region, so every leaf is a captured voxel).
+function Splinter.part(part: BasePart, minimumVoxelSize: number?, timeToReset: number?, unanchor: boolean?): Splint
+	local region: Region = { shape = "Box", cframe = part.CFrame, size = part.Size + Vector3.one }
+	local splint = newSplint(region)
+	if Adopt.eligible(part) or part:GetAttribute(ID_ATTRIBUTE) ~= nil then
+		splinterInto(splint, part, region, minimumVoxelSize or 1, timeToReset, { count = 0 })
+	end
+	if unanchor then
+		splint:Unanchor()
+	end
+	return splint
+end
+
+-- Cuts a part into two halves along its longest axis. The halves join the
+-- part's record, so reset timers restore through cuts too.
+function Splinter.cutInHalf(part: BasePart, timeToReset: number?): { BasePart }
 	if not (Adopt.eligible(part) or part:GetAttribute(ID_ATTRIBUTE) ~= nil) then
 		return {}
 	end
-	local region: Region = { shape = "Box", cframe = part.CFrame, size = part.Size + Vector3.one }
-	local id = recordFor(part, timeToReset)
-	register(id, part)
-	local out: { BasePart } = {}
-	subdivide(id, part, region, minimumVoxelSize or 1, out, { count = 0 })
-	return out
-end
-
--- Cuts a part into two halves along its longest axis.
-function Splinter.cutInHalf(part: BasePart): { BasePart }
-	if not Adopt.eligible(part) and part:GetAttribute(ID_ATTRIBUTE) == nil then
-		return {}
-	end
+	local record = recordFor(part, timeToReset)
+	register(record, part)
 	local size = part.Size
 	local axis = if size.X >= size.Y and size.X >= size.Z then Vector3.xAxis
 		elseif size.Y >= size.Z then Vector3.yAxis
 		else Vector3.zAxis
 	local halves = {}
 	for sign = -1, 1, 2 do
-		local half = part:Clone()
+		local half = blockCopy(part)
 		half.Size = size - axis * (size:Dot(axis) / 2)
 		half.CFrame = part.CFrame * CFrame.new(axis * size:Dot(axis) / 4 * sign)
 		half.Parent = part.Parent
+		register(record, half)
 		table.insert(halves, half)
 	end
+	unregister(record, part)
 	part:Destroy()
 	return halves
+end
+
+-- ---------------------------------------------------------------- hitboxes
+-- Moveable hitbox: follows a part (weld-like) or a manual pose, sweeping a
+-- Splinter.hitbox every `interval` seconds while started. VoxBreaker's
+-- CreateHitbox equivalent for swords, drills, projectiles.
+
+local Hitbox = {}
+Hitbox.__index = Hitbox
+
+export type Hitbox = typeof(setmetatable(
+	{} :: {
+		cframe: CFrame,
+		follow: BasePart?,
+		offset: CFrame,
+		shape: ("Ball" | "Box")?,
+		size: Vector3,
+		minimumVoxelSize: number?,
+		timeToReset: number?,
+		unanchor: boolean?,
+		kick: number?,
+		params: OverlapParams?,
+		interval: number,
+		enabled: boolean,
+		-- Fires (splint) after any sweep that captured voxels.
+		OnSplinter: typeof(Signal.new()),
+		_connection: RBXScriptConnection?,
+		_accum: number,
+	},
+	Hitbox
+))
+
+-- One immediate sweep at the current pose.
+function Hitbox.Sweep(self: Hitbox): Splint
+	return Splinter.hitbox({
+		shape = self.shape,
+		cframe = self.cframe,
+		size = self.size,
+		minimumVoxelSize = self.minimumVoxelSize,
+		timeToReset = self.timeToReset,
+		unanchor = self.unanchor,
+		kick = self.kick,
+		params = self.params,
+	})
+end
+
+function Hitbox.Start(self: Hitbox)
+	if self._connection then
+		return
+	end
+	self.enabled = true
+	self._accum = 0
+	self._connection = RunService.Heartbeat:Connect(function(dt: number)
+		self._accum += dt
+		if self._accum < self.interval then
+			return
+		end
+		self._accum = 0
+		local follow = self.follow
+		if follow then
+			if not follow.Parent then
+				self:Stop()
+				return
+			end
+			self.cframe = follow.CFrame * self.offset
+		end
+		local splint = self:Sweep()
+		if #splint.voxels > 0 then
+			self.OnSplinter:Fire(splint)
+		end
+	end)
+end
+
+function Hitbox.Stop(self: Hitbox)
+	self.enabled = false
+	if self._connection then
+		self._connection:Disconnect()
+		self._connection = nil
+	end
+end
+
+-- Manual pose (hitboxes without a `follow` part).
+function Hitbox.SetCFrame(self: Hitbox, cframe: CFrame)
+	self.cframe = cframe
+end
+
+function Hitbox.Destroy(self: Hitbox)
+	self:Stop()
+	self.OnSplinter:DisconnectAll()
+end
+
+function Splinter.attach(options: AttachOptions): Hitbox
+	assert(options.follow or options.cframe, "Splinter.attach needs `follow` or `cframe`")
+	local hitbox = setmetatable({
+		cframe = options.cframe or (options.follow :: BasePart).CFrame * (options.offset or CFrame.identity),
+		follow = options.follow,
+		offset = options.offset or CFrame.identity,
+		shape = options.shape,
+		size = options.size,
+		minimumVoxelSize = options.minimumVoxelSize,
+		timeToReset = options.timeToReset,
+		unanchor = options.unanchor,
+		kick = options.kick,
+		params = options.params,
+		interval = options.interval or 0.1,
+		enabled = false,
+		OnSplinter = Signal.new(),
+		_connection = nil :: RBXScriptConnection?,
+		_accum = 0,
+	}, Hitbox)
+	if options.autoStart ~= false then
+		hitbox:Start()
+	end
+	return hitbox
 end
 
 return Splinter
@@ -10163,8 +11882,12 @@ local Stress = {}
 
 local UNREACHED = 0xFFFF
 
+export type Warning = { index: number, severity: number }
+
 -- `seeds`: 0-based flat indices of grounded voxels. Returns 0-based indices
--- of voxels that fail by span or by crush.
+-- of voxels that fail by span or by crush, plus WARNINGS: voxels loaded past
+-- warnRatio of their capacity but not yet failing (severity = load/capacity,
+-- warnRatio..1) - the structure groaning before it goes.
 function Stress.unsupported(
 	voxels: buffer,
 	sx: number,
@@ -10174,8 +11897,9 @@ function Stress.unsupported(
 	strengthLut: { [number]: number },
 	loadFactor: number,
 	densityLut: { [number]: number }?,
-	crushFactor: number?
-): { number }
+	crushFactor: number?,
+	warnRatio: number?
+): ({ number }, { Warning })
 	local total = sx * sy * sz
 	local sxsz = sx * sz
 	local dist = buffer.create(total * 2)
@@ -10256,7 +11980,9 @@ function Stress.unsupported(
 		end
 	end
 
+	local MAX_WARNINGS = 64
 	local broken = {}
+	local warnings: { Warning } = {}
 	local brokenFlags = buffer.create(total)
 	for index = 0, total - 1 do
 		local id = buffer.readu16(voxels, index * 2)
@@ -10268,6 +11994,8 @@ function Stress.unsupported(
 		if d == UNREACHED or d > capacity then
 			table.insert(broken, index)
 			buffer.writeu8(brokenFlags, index, 1)
+		elseif warnRatio and capacity > 0 and d > capacity * warnRatio and #warnings < MAX_WARNINGS then
+			table.insert(warnings, { index = index, severity = d / capacity })
 		end
 	end
 
@@ -10290,7 +12018,8 @@ function Stress.unsupported(
 						load = 0
 						continue
 					end
-					if load > (strengthLut[id] or 0) * crushFactor then
+					local capacity = (strengthLut[id] or 0) * crushFactor
+					if load > capacity then
 						if buffer.readu8(brokenFlags, index) == 0 then
 							table.insert(broken, index)
 							buffer.writeu8(brokenFlags, index, 1)
@@ -10299,6 +12028,12 @@ function Stress.unsupported(
 						-- break; restart the accumulation.
 						load = 0
 					else
+						if
+							warnRatio and capacity > 0 and load > capacity * warnRatio
+							and #warnings < MAX_WARNINGS and buffer.readu8(brokenFlags, index) == 0
+						then
+							table.insert(warnings, { index = index, severity = load / capacity })
+						end
 						load += densityLut[id] or 0
 					end
 				end
@@ -10306,7 +12041,7 @@ function Stress.unsupported(
 		end
 	end
 
-	return broken
+	return broken, warnings
 end
 
 return Stress
@@ -10535,6 +12270,10 @@ local Config = {
 		-- before compression failure. Glass (strength 1, density 2.5) crushes
 		-- under ~22 voxels of itself; stone towers stand for hundreds.
 		crushFactor = 55,
+		-- Groans: voxels past this fraction of capacity (but holding) emit
+		-- OnCreak - the audible warning before failure. Cooldown per body.
+		warnRatio = 0.7,
+		creakCooldown = 2,
 	},
 
 	-- Impact / fracture
@@ -10562,6 +12301,20 @@ local Config = {
 		rimFracture = true,
 		rimSamples = 2,
 		rimMinVoxels = 600,
+	},
+
+	-- Fire: burning voxels consume fuel, spread to flammable neighbours
+	-- (material flammability 0..1 is the knob; adopted wood burns out of the
+	-- box), then burn away - collapse follows via topology/stress.
+	fire = {
+		enabled = true,
+		tickInterval = 0.3, -- seconds between spread/burn steps per body
+		spreadChance = 0.35, -- scaled by flammability; upward spread x1.5
+		burnSeconds = 4, -- fuel per voxel (randomized ±30%)
+		maxBurningPerBody = 500,
+		-- Explosions light their blast radius (x this scale) for free.
+		igniteFromExplosions = true,
+		explosionIgniteScale = 1.25,
 	},
 
 	-- Adoption: regular BaseParts hit by destruction ops get voxelized into
@@ -10593,12 +12346,31 @@ local Config = {
 		-- many seconds (their voxel body is removed; loose fragments remain
 		-- as debris). 0 = never respawn. Per-part ChunkrRespawn overrides.
 		respawnSeconds = 0,
+		-- MeshParts/unions raycast-sample their true collision shape
+		-- (per-column span marching) instead of filling the bounding box.
+		-- Wide flat meshes cost sx*sz column raycasts once at adoption; past
+		-- the budget they fall back to the box.
+		meshSampling = true,
+		meshColumnBudget = 16384,
+	},
+
+	-- Building: world:Build stamps solid boxes (merging into aligned bodies
+	-- when the box fits inside one); world:Place stamps Blueprints.
+	build = {
+		voxelSize = 1, -- studs/voxel for NEW bodies world:Build creates
+		maxVoxels = 100000, -- refuse absurd single builds
+	},
+
+	-- Persistence: world:Save/Load chunk snapshots through a DataStore.
+	persist = {
+		dataStore = "Chunkr",
 	},
 
 	-- Networking
 	net = {
 		maxOpsPerPlayerPerSecond = 30,
 		maxCarveRadius = 16, -- voxels; server rejects larger client requests
+		maxBuildSize = 16, -- studs per axis for client build requests
 	},
 }
 
@@ -10625,6 +12397,19 @@ local Events = {
 	-- (positionWorld, material, voxelCount) for islands below the debris floor
 	-- (the engine deletes them; the game decides if they become particles)
 	OnCrumble = Signal.new(),
+	-- (body, positionWorld, severity 0..1, warningCount) when a stress check
+	-- finds voxels loaded near capacity but still holding - the structure
+	-- groaning before the collapse. Cooldown per body (stress.creakCooldown).
+	OnCreak = Signal.new(),
+	-- (body, voxelCount, positionWorld) when voxels newly catch fire
+	OnIgnite = Signal.new(),
+	-- (body, burningCount, positionWorld) every fire tick while a body burns
+	-- (position samples one burning voxel - flame/smoke emitters track it)
+	OnBurn = Signal.new(),
+	-- (body, burnedCount, positionWorld) when voxels finish burning away
+	OnBurnout = Signal.new(),
+	-- (joint) when a Joint's host voxel/part is destroyed and it gives way
+	OnJointBroken = Signal.new(),
 	-- (body) lifecycle
 	OnBodyAdded = Signal.new(),
 	OnBodyRemoved = Signal.new(),
@@ -10734,6 +12519,315 @@ function Grid.rleDecode(encoded: buffer, expectedCount: number): buffer
 end
 
 return Grid
+]])
+mod("Persist", _14, [[
+-- Persist: world snapshots <-> DataStore-safe strings, with chunked save/
+-- load. Destruction survives server restarts:
+--
+--   world:Save("map1")            -- yields; snapshot -> DataStore chunks
+--   world:Load("map1")            -- yields; DataStore -> world:Reset
+--
+-- Material ids are session-dependent (adopted materials define lazily), so
+-- the blob carries an id -> NAME table; decode remaps voxel ids to the
+-- current registry by name. Unknown names keep their id and warn - define
+-- your materials before loading.
+--
+-- The codec itself is pure (encode/decode/base64); only Persist.datastore
+-- touches DataStoreService, and `store` is injectable everywhere - tests
+-- and custom backends (MemoryStore, external saves) pass their own
+-- { read = (key) -> string?, write = (key, value) -> () }.
+
+local Materials = require(script.Parent.Parent._Patterns.Materials)
+
+local Persist = {}
+
+local VERSION = 1
+local BLUEPRINT_HEADER = 10 -- u16 sx, u16 sy, u16 sz, f32 voxelSize
+
+export type Store = {
+	read: (key: string) -> string?,
+	write: (key: string, value: string) -> (),
+}
+
+-- ---------------------------------------------------------------- base64
+
+local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local B64_CHAR: { [number]: string } = {}
+local B64_VALUE: { [string]: number } = {}
+for i = 1, 64 do
+	local char = string.sub(B64, i, i)
+	B64_CHAR[i - 1] = char
+	B64_VALUE[char] = i - 1
+end
+
+function Persist.toBase64(data: buffer): string
+	local len = buffer.len(data)
+	local out = table.create((len + 2) // 3)
+	local i = 0
+	while i + 3 <= len do
+		local n = buffer.readu8(data, i) * 65536 + buffer.readu8(data, i + 1) * 256 + buffer.readu8(data, i + 2)
+		table.insert(out, B64_CHAR[n // 262144] .. B64_CHAR[n // 4096 % 64] .. B64_CHAR[n // 64 % 64] .. B64_CHAR[n % 64])
+		i += 3
+	end
+	local rest = len - i
+	if rest == 1 then
+		local n = buffer.readu8(data, i) * 65536
+		table.insert(out, B64_CHAR[n // 262144] .. B64_CHAR[n // 4096 % 64] .. "==")
+	elseif rest == 2 then
+		local n = buffer.readu8(data, i) * 65536 + buffer.readu8(data, i + 1) * 256
+		table.insert(out, B64_CHAR[n // 262144] .. B64_CHAR[n // 4096 % 64] .. B64_CHAR[n // 64 % 64] .. "=")
+	end
+	return table.concat(out)
+end
+
+function Persist.fromBase64(text: string): buffer
+	local clean = string.gsub(text, "=", "")
+	local outLen = #clean * 3 // 4
+	local out = buffer.create(outLen)
+	local cursor = 0
+	local i = 1
+	while i + 4 <= #clean + 1 do
+		local a = B64_VALUE[string.sub(clean, i, i)]
+		local b = B64_VALUE[string.sub(clean, i + 1, i + 1)]
+		local c = B64_VALUE[string.sub(clean, i + 2, i + 2)]
+		local d = B64_VALUE[string.sub(clean, i + 3, i + 3)]
+		local n = a * 262144 + b * 4096 + c * 64 + d
+		buffer.writeu8(out, cursor, n // 65536)
+		buffer.writeu8(out, cursor + 1, n // 256 % 256)
+		buffer.writeu8(out, cursor + 2, n % 256)
+		cursor += 3
+		i += 4
+	end
+	local rest = #clean - (i - 1)
+	if rest == 2 then
+		local a = B64_VALUE[string.sub(clean, i, i)]
+		local b = B64_VALUE[string.sub(clean, i + 1, i + 1)]
+		buffer.writeu8(out, cursor, (a * 262144 + b * 4096) // 65536)
+	elseif rest == 3 then
+		local a = B64_VALUE[string.sub(clean, i, i)]
+		local b = B64_VALUE[string.sub(clean, i + 1, i + 1)]
+		local c = B64_VALUE[string.sub(clean, i + 2, i + 2)]
+		local n = a * 262144 + b * 4096 + c * 64
+		buffer.writeu8(out, cursor, n // 65536)
+		buffer.writeu8(out, cursor + 1, n // 256 % 256)
+	end
+	return out
+end
+
+-- ---------------------------------------------------------------- codec
+-- Blob layout (little-endian):
+--   u8 version
+--   u16 materialCount, then per material: u16 id, u8 nameLen, name bytes
+--   u16 bodyCount, then per body:
+--     12 x f32 cframe components, u8 flags (1 anchored, 2 carvable),
+--     u32 dataLen, serialized Blueprint bytes
+
+type SnapshotEntry = { data: buffer, cframe: any, anchored: boolean?, carvable: boolean? }
+
+function Persist.encode(snapshot: { SnapshotEntry }): string
+	-- Size pass.
+	local materials = Materials.all()
+	local size = 1 + 2
+	for _, material in materials do
+		size += 2 + 1 + #material.name
+	end
+	size += 2
+	for _, entry in snapshot do
+		size += 48 + 1 + 4 + buffer.len(entry.data)
+	end
+
+	local out = buffer.create(size)
+	local o = 0
+	buffer.writeu8(out, o, VERSION)
+	o += 1
+
+	local materialCount = 0
+	for _ in materials do
+		materialCount += 1
+	end
+	buffer.writeu16(out, o, materialCount)
+	o += 2
+	for id, material in materials do
+		buffer.writeu16(out, o, id)
+		buffer.writeu8(out, o + 2, math.min(#material.name, 255))
+		o += 3
+		local name = string.sub(material.name, 1, 255)
+		buffer.writestring(out, o, name)
+		o += #name
+	end
+
+	buffer.writeu16(out, o, #snapshot)
+	o += 2
+	for _, entry in snapshot do
+		local components = { entry.cframe:GetComponents() }
+		for i = 1, 12 do
+			buffer.writef32(out, o, components[i])
+			o += 4
+		end
+		local flags = (if entry.anchored then 1 else 0) + (if entry.carvable ~= false then 2 else 0)
+		buffer.writeu8(out, o, flags)
+		o += 1
+		buffer.writeu32(out, o, buffer.len(entry.data))
+		o += 4
+		buffer.copy(out, o, entry.data, 0)
+		o += buffer.len(entry.data)
+	end
+
+	return Persist.toBase64(out)
+end
+
+-- Rewrites material ids inside a serialized Blueprint's RLE stream in place.
+local function remapBlueprint(data: buffer, remap: { [number]: number })
+	local len = buffer.len(data)
+	local o = BLUEPRINT_HEADER
+	while o + 4 <= len do
+		local value = buffer.readu16(data, o + 2)
+		if value ~= 0 then
+			local mapped = remap[value]
+			if mapped and mapped ~= value then
+				buffer.writeu16(data, o + 2, mapped)
+			end
+		end
+		o += 4
+	end
+end
+
+-- `cframeFactory(12 components) -> CFrame` defaults to the Roblox global
+-- (injectable for headless tests).
+function Persist.decode(text: string, cframeFactory: ((...number) -> any)?): { SnapshotEntry }
+	local factory = cframeFactory or function(...)
+		return CFrame.new(...)
+	end
+	local data = Persist.fromBase64(text)
+	local o = 0
+	local version = buffer.readu8(data, o)
+	o += 1
+	assert(version == VERSION, `Persist: unknown blob version {version}`)
+
+	-- Saved id -> current id, by name.
+	local remap: { [number]: number } = {}
+	local needsRemap = false
+	local materialCount = buffer.readu16(data, o)
+	o += 2
+	for _ = 1, materialCount do
+		local id = buffer.readu16(data, o)
+		local nameLen = buffer.readu8(data, o + 2)
+		o += 3
+		local name = buffer.readstring(data, o, nameLen)
+		o += nameLen
+		local current = Materials.find(name)
+		if current then
+			remap[id] = current.id
+			if current.id ~= id then
+				needsRemap = true
+			end
+		else
+			warn(`[Chunkr] persist: material "{name}" (id {id}) not defined in this session; voxels keep the stale id`)
+		end
+	end
+
+	local snapshot: { SnapshotEntry } = {}
+	local bodyCount = buffer.readu16(data, o)
+	o += 2
+	for _ = 1, bodyCount do
+		local components = table.create(12)
+		for i = 1, 12 do
+			components[i] = buffer.readf32(data, o)
+			o += 4
+		end
+		local flags = buffer.readu8(data, o)
+		o += 1
+		local dataLen = buffer.readu32(data, o)
+		o += 4
+		local body = buffer.create(dataLen)
+		buffer.copy(body, 0, data, o, dataLen)
+		o += dataLen
+		if needsRemap then
+			remapBlueprint(body, remap)
+		end
+		table.insert(snapshot, {
+			data = body,
+			cframe = factory(table.unpack(components)),
+			anchored = flags % 2 == 1,
+			carvable = flags // 2 % 2 == 1,
+		})
+	end
+	return snapshot
+end
+
+-- ---------------------------------------------------------------- stores
+
+-- DataStore-backed store (server only; call from a context where DataStore
+-- access is allowed). One logical save spans `{key}` meta + `{key}/N` chunks.
+function Persist.datastore(name: string): Store
+	local DataStoreService = game:GetService("DataStoreService")
+	local store = DataStoreService:GetDataStore(name)
+	return {
+		read = function(key: string): string?
+			local value = store:GetAsync(key)
+			return if type(value) == "string" then value else nil
+		end,
+		write = function(key: string, value: string)
+			store:SetAsync(key, value)
+		end,
+	}
+end
+
+-- In-memory store (tests, single-session undo points).
+function Persist.memoryStore(): Store
+	local kv: { [string]: string } = {}
+	return {
+		read = function(key: string): string?
+			return kv[key]
+		end,
+		write = function(key: string, value: string)
+			kv[key] = value
+		end,
+	}
+end
+
+-- ---------------------------------------------------------------- save/load
+
+-- Splits the encoded blob across `{key}` (meta "v1|chunkCount") and
+-- `{key}/N` chunk keys. Returns the chunk count. Yields on real stores.
+function Persist.save(world: any, key: string, store: Store, chunkChars: number?): number
+	local blob = Persist.encode(world:Snapshot())
+	local max = chunkChars or 3_000_000
+	local chunks = math.max(1, math.ceil(#blob / max))
+	for i = 1, chunks do
+		store.write(`{key}/{i}`, string.sub(blob, (i - 1) * max + 1, i * max))
+	end
+	store.write(key, `v1|{chunks}`)
+	return chunks
+end
+
+-- Reads the chunks back and resets the world to the decoded snapshot.
+-- Returns false when nothing is saved under `key`. `cframeFactory` as in
+-- Persist.decode (headless tests only).
+function Persist.load(world: any, key: string, store: Store, parent: Instance?, cframeFactory: ((...number) -> any)?): boolean
+	local meta = store.read(key)
+	if not meta then
+		return false
+	end
+	local chunkCount = tonumber(string.match(meta, "^v1|(%d+)$"))
+	if not chunkCount then
+		warn(`[Chunkr] persist: bad meta under "{key}": {meta}`)
+		return false
+	end
+	local parts = table.create(chunkCount)
+	for i = 1, chunkCount do
+		local chunk = store.read(`{key}/{i}`)
+		if not chunk then
+			warn(`[Chunkr] persist: missing chunk {i}/{chunkCount} under "{key}"`)
+			return false
+		end
+		parts[i] = chunk
+	end
+	world:Reset(Persist.decode(table.concat(parts), cframeFactory), parent)
+	return true
+end
+
+return Persist
 ]])
 mod("Query", _14, [[
 --!native
@@ -10870,6 +12964,62 @@ end
 
 return Raycast
 ]])
+mod("Shapes", _14, [[
+-- Shape containment for Part primitives, shared by adoption's voxel fill and
+-- Splinter's shape-aware subdivision. Points are in part-local studs with
+-- `half` = part.Size / 2. MeshParts/unions report "Block" here - adoption
+-- raycast-samples their true shape separately (Adopt meshSampling); Splinter
+-- treats them as boxes.
+
+local Shapes = {}
+
+export type Kind = "Block" | "Ball" | "Cylinder" | "Wedge" | "CornerWedge"
+
+-- Which primitive does this instance voxelize as?
+function Shapes.kind(part: BasePart): Kind
+	if part:IsA("Part") then
+		local shape = part.Shape
+		if shape == Enum.PartType.Ball then
+			return "Ball"
+		elseif shape == Enum.PartType.Cylinder then
+			return "Cylinder"
+		elseif shape == Enum.PartType.Wedge then
+			return "Wedge"
+		elseif shape == Enum.PartType.CornerWedge then
+			return "CornerWedge"
+		end
+		return "Block"
+	elseif part:IsA("WedgePart") then
+		return "Wedge"
+	elseif part:IsA("CornerWedgePart") then
+		return "CornerWedge"
+	end
+	return "Block" -- MeshPart/unions/etc: bounding box (v1)
+end
+
+-- Is the part-local point (px,py,pz) inside the shape?
+function Shapes.contains(kind: Kind, px: number, py: number, pz: number, half: Vector3): boolean
+	if math.abs(px) > half.X or math.abs(py) > half.Y or math.abs(pz) > half.Z then
+		return false
+	end
+	if kind == "Ball" then
+		local radius = math.min(half.X, half.Y, half.Z)
+		return px * px + py * py + pz * pz <= radius * radius
+	elseif kind == "Cylinder" then
+		-- Roblox cylinders lie along X.
+		local radius = math.min(half.Y, half.Z)
+		return py * py + pz * pz <= radius * radius
+	elseif kind == "Wedge" then
+		return (py + half.Y) / (half.Y * 2) <= (pz + half.Z) / (half.Z * 2)
+	elseif kind == "CornerWedge" then
+		local yFrac = (py + half.Y) / (half.Y * 2)
+		return yFrac <= (px + half.X) / (half.X * 2) and yFrac <= (half.Z - pz) / (half.Z * 2)
+	end
+	return true -- Block
+end
+
+return Shapes
+]])
 mod("Vox", _14, [[
 --!native
 -- MagicaVoxel .vox importer. Parses the first model (SIZE + XYZI) and the
@@ -10994,5 +13144,5 @@ end
 return Vox
 ]])
 
-print("[Chunkr] installed 67 modules (1 scripts) under ReplicatedStorage.Chunkr")
+print("[Chunkr] installed 72 modules (1 scripts) under ReplicatedStorage.Chunkr")
 return true
