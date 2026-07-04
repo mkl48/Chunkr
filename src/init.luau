@@ -33,10 +33,14 @@ local FracturePattern = require(script._Classes.FracturePattern)
 local Materials = require(script._Patterns.Materials)
 local Fracture = require(script._Patterns.Fracture)
 local Splinter = require(script._Patterns.Splinter)
+local Vapor = require(script._Patterns.Vapor)
 local Persist = require(script._Utility.Persist)
 local Stencils = require(script._Utility.Stencils)
 local Relief = require(script._Main.Relief)
 local Vfx = require(script._Main.Vfx)
+local Marks = require(script._Main.Marks)
+local Xray = require(script._Main.Xray)
+local Cable = require(script._Classes.Cable)
 local World = require(script._Main.World)
 local Server = require(script._Main.Server)
 local Client = require(script._Main.Client)
@@ -76,6 +80,18 @@ Chunkr.Relief = Relief
 -- Chunkr.client().vfx, auto-driven by fx.start({ voxels = true })), but the
 -- cubes are plain anchored parts that replicate, so it works server-side too.
 Chunkr.Vfx = Vfx
+-- Persistent per-voxel marks (paint/scorch/blood/holes) that survive rebuilds.
+-- world:Paint(origin, dir, dist, opts) or Chunkr.Marks.stamp(body, pos, normal).
+Chunkr.Marks = Marks
+-- Coarse gas sim: smoke/steam/dust/flammable gas that flows and ignites.
+-- world:Vent / world:LeakGas / world:Spark, or the Chunkr.Vapor surface.
+Chunkr.Vapor = Vapor
+-- Physical sagging, cuttable cables between two points (suspension bridges,
+-- chandeliers, drawbridges). Chunkr.Cable.create{ a = ..., b = ... }.
+Chunkr.Cable = Cable
+-- Stress x-ray: Chunkr:ShowStress() / :HideStress() ghosts anchored structures
+-- green->red by how close each voxel is to failing.
+Chunkr.Xray = Xray
 
 export type Material = Types.Material
 export type FractureTable = Types.FractureTable
@@ -112,6 +128,7 @@ function Chunkr.new(overrides: any?): Chunkr
 	assert(RunService:IsServer(), "Chunkr.new is server-side; use Chunkr.client() on clients")
 	local config = mergedConfig(overrides)
 	Relief.configure(config.relief)
+	Xray.configure(config.stress)
 	return setmetatable({
 		world = World.new(config),
 		config = config,
@@ -181,6 +198,38 @@ function Chunkr.Cutout(self: Chunkr, cframe: CFrame, stencil: Stencils.Stencil, 
 	return self.world:Cutout(cframe, stencil, size, depthStuds, power)
 end
 
+-- ---------------------------------------------------------------- vapor / marks / x-ray
+
+-- Add gas of a kind ("smoke"/"steam"/"dust"/"gas") at a world point.
+function Chunkr.Vent(self: Chunkr, position: Vector3, kind: string, amount: number)
+	self.world:Vent(position, kind, amount)
+end
+
+-- Release flammable gas (Vent shorthand). Ignite it with :Spark or a blast.
+function Chunkr.LeakGas(self: Chunkr, position: Vector3, amount: number)
+	self.world:LeakGas(position, amount)
+end
+
+-- Ignite flammable gas within radius -> flash + chain reaction.
+function Chunkr.Spark(self: Chunkr, position: Vector3, radius: number?): number
+	return self.world:Spark(position, radius)
+end
+
+-- Raycast into the world and stamp a persistent mark (paint/scorch/blood/hole)
+-- where it lands. Returns whether it stuck.
+function Chunkr.Paint(self: Chunkr, origin: Vector3, direction: Vector3, maxDistance: number, options: Marks.Options?): boolean
+	return self.world:Paint(origin, direction, maxDistance, options)
+end
+
+-- Toggle the stress x-ray overlay on every anchored structure.
+function Chunkr.ShowStress(self: Chunkr)
+	Xray.show(self.world)
+end
+
+function Chunkr.HideStress(self: Chunkr)
+	Xray.hide()
+end
+
 -- Lights every flammable voxel in the sphere (plain parts in reach are
 -- adopted first). Fire spreads by material flammability, then burnt voxels
 -- delete - collapse follows naturally. Explosions also auto-ignite.
@@ -246,6 +295,10 @@ function Chunkr.Start(self: Chunkr)
 		body.needsRemesh = true
 	end
 	Server.start(self.world, self.config)
+	-- Fire smokes, blasts kick up dust and can touch off gas - on by default.
+	if self.config.vapor.enabled then
+		Vapor.autowire(self.world)
+	end
 end
 
 function Chunkr.Stop(self: Chunkr)

@@ -188,4 +188,134 @@ function Stress.unsupported(
 	return broken, warnings
 end
 
+-- Diagnostic field for the x-ray overlay: per-voxel severity = load/capacity
+-- (max of the span and crush ratios), so callers can colour a structure by
+-- how close each voxel is to failing. Same physics as unsupported(), but it
+-- records ratios for EVERY solid voxel instead of just the failures. Returns
+-- an f32 buffer (one per voxel; 0 for air). >= 1 means already failing.
+-- Main-thread diagnostic - not on the worker path.
+function Stress.field(
+	voxels: buffer,
+	sx: number,
+	sy: number,
+	sz: number,
+	seeds: { number },
+	strengthLut: { [number]: number },
+	loadFactor: number,
+	densityLut: { [number]: number }?,
+	crushFactor: number?
+): buffer
+	local total = sx * sy * sz
+	local sxsz = sx * sz
+	local dist = buffer.create(total * 2)
+	buffer.fill(dist, 0, 0xFF)
+
+	local maxCapacity = 0
+	for _, strength in strengthLut do
+		local capacity = strength * loadFactor
+		if capacity > maxCapacity then
+			maxCapacity = capacity
+		end
+	end
+	local maxD = math.min(math.floor(maxCapacity) + 1, UNREACHED - 1)
+
+	local buckets: { { number } } = {}
+	for d = 0, maxD do
+		buckets[d] = {}
+	end
+	for _, index in seeds do
+		if buffer.readu16(voxels, index * 2) ~= 0 and buffer.readu16(dist, index * 2) == UNREACHED then
+			buffer.writeu16(dist, index * 2, 0)
+			table.insert(buckets[0], index)
+		end
+	end
+
+	for d = 0, maxD do
+		local bucket = buckets[d]
+		local head = 1
+		while head <= #bucket do
+			local index = bucket[head]
+			head += 1
+			if buffer.readu16(dist, index * 2) ~= d then
+				continue
+			end
+			local x = index % sx
+			local y = index // sxsz
+			local z = (index // sx) % sz
+
+			local function relax(nx: number, ny: number, nz: number, cost: number)
+				if nx < 0 or ny < 0 or nz < 0 or nx >= sx or ny >= sy or nz >= sz then
+					return
+				end
+				local nd = d + cost
+				if nd > maxD then
+					return
+				end
+				local ni = nx + nz * sx + ny * sxsz
+				if buffer.readu16(voxels, ni * 2) ~= 0 and nd < buffer.readu16(dist, ni * 2) then
+					buffer.writeu16(dist, ni * 2, nd)
+					table.insert(buckets[nd], ni)
+				end
+			end
+			local function sideCost(nx: number, ny: number, nz: number): number
+				if ny > 0 and buffer.readu16(voxels, (nx + nz * sx + (ny - 1) * sxsz) * 2) ~= 0 then
+					return 1
+				end
+				return 2
+			end
+			relax(x, y + 1, z, 0)
+			if x > 0 then
+				relax(x - 1, y, z, sideCost(x - 1, y, z))
+			end
+			if x + 1 < sx then
+				relax(x + 1, y, z, sideCost(x + 1, y, z))
+			end
+			if z > 0 then
+				relax(x, y, z - 1, sideCost(x, y, z - 1))
+			end
+			if z + 1 < sz then
+				relax(x, y, z + 1, sideCost(x, y, z + 1))
+			end
+			relax(x, y - 1, z, 2)
+		end
+	end
+
+	local field = buffer.create(total * 4)
+	for index = 0, total - 1 do
+		local id = buffer.readu16(voxels, index * 2)
+		if id == 0 then
+			continue
+		end
+		local capacity = (strengthLut[id] or 0) * loadFactor
+		local d = buffer.readu16(dist, index * 2)
+		local ratio = if d == UNREACHED then 1.5 elseif capacity > 0 then d / capacity else 0
+		buffer.writef32(field, index * 4, ratio)
+	end
+
+	-- Crush pass folds in the compression ratio (take the worse of the two).
+	if densityLut and crushFactor then
+		for z = 0, sz - 1 do
+			for x = 0, sx - 1 do
+				local load = 0
+				for y = sy - 1, 0, -1 do
+					local index = x + z * sx + y * sxsz
+					local id = buffer.readu16(voxels, index * 2)
+					if id == 0 then
+						load = 0
+						continue
+					end
+					local capacity = (strengthLut[id] or 0) * crushFactor
+					local ratio = if capacity > 0 then load / capacity else 0
+					if ratio > buffer.readf32(field, index * 4) then
+						buffer.writef32(field, index * 4, ratio)
+					end
+					load += densityLut[id] or 0
+				end
+			end
+		end
+	end
+
+	return field
+end
+
 return Stress

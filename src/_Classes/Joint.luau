@@ -26,6 +26,8 @@
 -- slack (constraint re-links on the fragment's OnBodyRebuilt). Joints are
 -- not captured in Snapshots. Server only.
 
+local CollectionService = game:GetService("CollectionService")
+
 local Signal = require(script.Parent.Parent._Packages.Signal)
 local Body = require(script.Parent.Body)
 local Anchor = require(script.Parent.Anchor)
@@ -101,11 +103,13 @@ local function frameAlong(position: Vector3, axis: Vector3?): CFrame
 	return CFrame.fromMatrix(position, x, y, z)
 end
 
--- The assembly Part whose box contains this voxel's centre.
+-- The assembly Part whose box contains this voxel's centre. Only real chunk
+-- parts count - decorative overlays (relief tiles, marks, x-ray ghosts) share
+-- the model but must never host a joint.
 local function containingPart(body: Body.Body, x: number, y: number, z: number): BasePart?
 	local worldPos = body:LocalToWorld(x, y, z)
 	for _, part in body.model:GetChildren() do
-		if part:IsA("BasePart") then
+		if part:IsA("BasePart") and CollectionService:HasTag(part, Body.PART_TAG) then
 			local lp = part.CFrame:PointToObjectSpace(worldPos)
 			local h = part.Size / 2 + Vector3.one * 1e-3
 			if math.abs(lp.X) <= h.X and math.abs(lp.Y) <= h.Y and math.abs(lp.Z) <= h.Z then

@@ -122,6 +122,29 @@ local Config = {
 		maxVoxels = 100000, -- refuse absurd single builds
 	},
 
+	-- Vapor: coarse gas sim (smoke/steam/dust/flammable gas) that flows,
+	-- rises/settles, decays, and ignites. Ticked from Simulation.
+	vapor = {
+		enabled = true,
+		cellSize = 4, -- studs per gas cell
+		tickInterval = 0.25,
+		diffuse = 0.28, -- fraction of a cell's density that flows out per tick
+		buoyancy = 0.6, -- vertical bias strength (× the kind's rise)
+		decay = 0.14, -- baseline; per-kind decay lives in Vapor.KINDS
+		epsilon = 0.02, -- density below this is pruned
+		maxCells = 256, -- active-cell budget (faintest dropped past it)
+		maxDensity = 4, -- per-cell density cap
+		-- Gas flash when ignited: a real explosion at the cell.
+		flashPower = 6,
+		flashRadiusScale = 1.2,
+		-- Fire vents smoke and can touch off gas.
+		emitFromFire = true,
+		fireSmoke = 0.5, -- smoke density added per burning tick
+		-- Explosions kick up dust and try to ignite gas in the blast.
+		emitFromExplosions = true,
+		explosionDust = 1.5,
+	},
+
 	-- Relief: physical surface texture (proud bricks, recessed panels) tiled
 	-- from a body's exposed surface. Decorative, so it's capped hard.
 	relief = {

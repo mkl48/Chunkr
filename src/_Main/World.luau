@@ -10,6 +10,8 @@ local Fracture = require(script.Parent.Parent._Patterns.Fracture)
 local Impact = require(script.Parent.Parent._Patterns.Impact)
 local Adopt = require(script.Parent.Parent._Patterns.Adopt)
 local Fire = require(script.Parent.Parent._Patterns.Fire)
+local Vapor = require(script.Parent.Parent._Patterns.Vapor)
+local Marks = require(script.Parent.Marks)
 local Bin = require(script.Parent.Parent._Utility.Bin)
 local Raycast = require(script.Parent.Parent._Utility.Raycast)
 local Persist = require(script.Parent.Parent._Utility.Persist)
@@ -25,6 +27,10 @@ export type World = typeof(setmetatable(
 	{} :: {
 		bodies: { [number]: Body.Body },
 		config: any,
+		-- Vapor sim state (owned by Patterns/Vapor; declared here so no caller
+		-- needs an `:: any` cast to reach it).
+		_vapor: any?,
+		_vaporWired: boolean?,
 	},
 	World
 ))
@@ -230,7 +236,35 @@ function World.Explode(self: World, position: Vector3, radiusStuds: number, powe
 	if fire.enabled and fire.igniteFromExplosions then
 		Fire.igniteSphere(self, position, radiusStuds * fire.explosionIgniteScale)
 	end
+	-- ...kick up a dust cloud and try to touch off any gas in the blast.
+	local vapor = self.config.vapor
+	if vapor.enabled and vapor.emitFromExplosions then
+		Vapor.emit(self, position, "dust", vapor.explosionDust)
+		Vapor.spark(self, position, radiusStuds)
+	end
 	return removed
+end
+
+-- ---------------------------------------------------------------- vapor / marks
+
+-- Add gas of a kind ("smoke"/"steam"/"dust"/"gas") at a world point.
+function World.Vent(self: World, position: Vector3, kind: string, amount: number)
+	Vapor.emit(self, position, kind, amount)
+end
+
+-- Release flammable gas (shorthand for Vent(..., "gas", ...)).
+function World.LeakGas(self: World, position: Vector3, amount: number)
+	Vapor.emit(self, position, "gas", amount)
+end
+
+-- Ignite flammable gas within radius (default ~1.5 cells). Returns cells lit.
+function World.Spark(self: World, position: Vector3, radius: number?): number
+	return Vapor.spark(self, position, radius or self.config.vapor.cellSize * 1.5)
+end
+
+-- Raycast into the world and stamp a persistent mark where it hits.
+function World.Paint(self: World, origin: Vector3, direction: Vector3, maxDistance: number, options: Marks.Options?): boolean
+	return Marks.paint(self, origin, direction, maxDistance, options)
 end
 
 -- Lights every flammable voxel in the sphere; plain parts in reach are

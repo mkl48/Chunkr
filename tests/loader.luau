@@ -31,6 +31,13 @@ local FILES = {
 	["_Utility.Vox"] = "src/_Utility/Vox.luau",
 	["_Utility.Persist"] = "src/_Utility/Persist.luau",
 	["_Utility.Stencils"] = "src/_Utility/Stencils.luau",
+	-- Vapor's pure sim (_diffuse/_ignite) is headless-testable; its runtime
+	-- deps (Events/Bin/Signal) only touch Roblox inside functions, so the
+	-- module loads fine even though its render path never runs here.
+	["_Packages.Signal"] = "src/_Packages/Signal.luau",
+	["_Utility.Events"] = "src/_Utility/Events.luau",
+	["_Utility.Bin"] = "src/_Utility/Bin.luau",
+	["_Patterns.Vapor"] = "src/_Patterns/Vapor.luau",
 }
 
 local nodeMt = {}

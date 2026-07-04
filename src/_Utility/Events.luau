@@ -29,6 +29,8 @@ local Events = {
 	OnBurn = Signal.new(),
 	-- (body, burnedCount, positionWorld) when voxels finish burning away
 	OnBurnout = Signal.new(),
+	-- (positionWorld, kind) when a flammable vapor cell ignites and flashes
+	OnVaporIgnite = Signal.new(),
 	-- (joint) when a Joint's host voxel/part is destroyed and it gives way
 	OnJointBroken = Signal.new(),
 	-- (body) lifecycle

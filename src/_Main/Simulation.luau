@@ -19,6 +19,7 @@ local Materials = require(script.Parent.Parent._Patterns.Materials)
 local Fracture = require(script.Parent.Parent._Patterns.Fracture)
 local Impact = require(script.Parent.Parent._Patterns.Impact)
 local Fire = require(script.Parent.Parent._Patterns.Fire)
+local Vapor = require(script.Parent.Parent._Patterns.Vapor)
 local Carve = require(script.Parent.Parent._Patterns.Carve)
 local Debris = require(script.Parent.Parent._Patterns.Debris)
 local Topology = require(script.Parent.Parent._Patterns.Topology)
@@ -322,6 +323,12 @@ local function step(world: any)
 	-- feed step 2's topology next tick, so burnt-through pieces drop).
 	if config.fire.enabled then
 		Fire.step(world)
+	end
+
+	-- 3.6. Vapor: gas flows/rises/decays, flammable gas flashes (the flash
+	-- is a real explosion, so it re-enters the destruction path).
+	if config.vapor.enabled then
+		Vapor.step(world)
 	end
 
 	-- 4. Anchors ride their (possibly moving) bodies.

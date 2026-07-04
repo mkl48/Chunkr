@@ -140,6 +140,28 @@ do
 	eq(#eaten, 0, "glass pane survives stress")
 end
 
+-- ------------------------------------------------- Stress.field (x-ray)
+do
+	-- Cantilever: severity climbs from the anchored base to the free tip.
+	local beam = Volume.new(6, 1, 1)
+	beam:FillBox(0, 0, 0, 5, 0, 0, 2)
+	local field = Stress.field(beam.voxels, 6, 1, 1, { 0 }, { [2] = 3 }, 4)
+	local baseSeverity = buffer.readf32(field, 0 * 4)
+	local tipSeverity = buffer.readf32(field, 5 * 4)
+	eq(baseSeverity, 0, "cantilever base is unstressed (severity 0)")
+	eq(tipSeverity > baseSeverity, true, "cantilever severity rises toward the tip")
+	eq(tipSeverity > 0.5, true, "cantilever tip is meaningfully loaded")
+
+	-- Crush: a tall column is most stressed at the base (weight above).
+	local tower = Volume.new(1, 30, 1)
+	tower:FillBox(0, 0, 0, 0, 29, 0, 3)
+	local cfield = Stress.field(tower.voxels, 1, 30, 1, { 0 }, { [3] = 1 }, 8, { [3] = 2.5 }, 20)
+	local baseCrush = buffer.readf32(cfield, 0 * 4)
+	local topCrush = buffer.readf32(cfield, 29 * 4)
+	eq(baseCrush > topCrush, true, "crush severity is highest at the base")
+	eq(baseCrush > 1, true, "over-tall column base reads past failure (>= 1)")
+end
+
 -- ------------------------------------------------- Raycast DDA
 do
 	local v = Volume.new(8, 8, 8)

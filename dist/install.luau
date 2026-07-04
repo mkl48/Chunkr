@@ -77,10 +77,14 @@ local FracturePattern = require(script._Classes.FracturePattern)
 local Materials = require(script._Patterns.Materials)
 local Fracture = require(script._Patterns.Fracture)
 local Splinter = require(script._Patterns.Splinter)
+local Vapor = require(script._Patterns.Vapor)
 local Persist = require(script._Utility.Persist)
 local Stencils = require(script._Utility.Stencils)
 local Relief = require(script._Main.Relief)
 local Vfx = require(script._Main.Vfx)
+local Marks = require(script._Main.Marks)
+local Xray = require(script._Main.Xray)
+local Cable = require(script._Classes.Cable)
 local World = require(script._Main.World)
 local Server = require(script._Main.Server)
 local Client = require(script._Main.Client)
@@ -120,6 +124,18 @@ Chunkr.Relief = Relief
 -- Chunkr.client().vfx, auto-driven by fx.start({ voxels = true })), but the
 -- cubes are plain anchored parts that replicate, so it works server-side too.
 Chunkr.Vfx = Vfx
+-- Persistent per-voxel marks (paint/scorch/blood/holes) that survive rebuilds.
+-- world:Paint(origin, dir, dist, opts) or Chunkr.Marks.stamp(body, pos, normal).
+Chunkr.Marks = Marks
+-- Coarse gas sim: smoke/steam/dust/flammable gas that flows and ignites.
+-- world:Vent / world:LeakGas / world:Spark, or the Chunkr.Vapor surface.
+Chunkr.Vapor = Vapor
+-- Physical sagging, cuttable cables between two points (suspension bridges,
+-- chandeliers, drawbridges). Chunkr.Cable.create{ a = ..., b = ... }.
+Chunkr.Cable = Cable
+-- Stress x-ray: Chunkr:ShowStress() / :HideStress() ghosts anchored structures
+-- green->red by how close each voxel is to failing.
+Chunkr.Xray = Xray
 
 export type Material = Types.Material
 export type FractureTable = Types.FractureTable
@@ -156,6 +172,7 @@ function Chunkr.new(overrides: any?): Chunkr
 	assert(RunService:IsServer(), "Chunkr.new is server-side; use Chunkr.client() on clients")
 	local config = mergedConfig(overrides)
 	Relief.configure(config.relief)
+	Xray.configure(config.stress)
 	return setmetatable({
 		world = World.new(config),
 		config = config,
@@ -225,6 +242,38 @@ function Chunkr.Cutout(self: Chunkr, cframe: CFrame, stencil: Stencils.Stencil, 
 	return self.world:Cutout(cframe, stencil, size, depthStuds, power)
 end
 
+-- ---------------------------------------------------------------- vapor / marks / x-ray
+
+-- Add gas of a kind ("smoke"/"steam"/"dust"/"gas") at a world point.
+function Chunkr.Vent(self: Chunkr, position: Vector3, kind: string, amount: number)
+	self.world:Vent(position, kind, amount)
+end
+
+-- Release flammable gas (Vent shorthand). Ignite it with :Spark or a blast.
+function Chunkr.LeakGas(self: Chunkr, position: Vector3, amount: number)
+	self.world:LeakGas(position, amount)
+end
+
+-- Ignite flammable gas within radius -> flash + chain reaction.
+function Chunkr.Spark(self: Chunkr, position: Vector3, radius: number?): number
+	return self.world:Spark(position, radius)
+end
+
+-- Raycast into the world and stamp a persistent mark (paint/scorch/blood/hole)
+-- where it lands. Returns whether it stuck.
+function Chunkr.Paint(self: Chunkr, origin: Vector3, direction: Vector3, maxDistance: number, options: Marks.Options?): boolean
+	return self.world:Paint(origin, direction, maxDistance, options)
+end
+
+-- Toggle the stress x-ray overlay on every anchored structure.
+function Chunkr.ShowStress(self: Chunkr)
+	Xray.show(self.world)
+end
+
+function Chunkr.HideStress(self: Chunkr)
+	Xray.hide()
+end
+
 -- Lights every flammable voxel in the sphere (plain parts in reach are
 -- adopted first). Fire spreads by material flammability, then burnt voxels
 -- delete - collapse follows naturally. Explosions also auto-ignite.
@@ -290,6 +339,10 @@ function Chunkr.Start(self: Chunkr)
 		body.needsRemesh = true
 	end
 	Server.start(self.world, self.config)
+	-- Fire smokes, blasts kick up dust and can touch off gas - on by default.
+	if self.config.vapor.enabled then
+		Vapor.autowire(self.world)
+	end
 end
 
 function Chunkr.Stop(self: Chunkr)
@@ -1058,6 +1111,315 @@ end
 
 return Body
 ]])
+mod("Cable", _2, [[
+-- Cables: a physical, sagging, cuttable rope between two points. A chain of
+-- thin dynamic segments linked by RopeConstraints hangs under gravity and
+-- swings; cut it anywhere and it parts into two dangling halves, dropping
+-- whatever it held.
+--
+--   local cable = Chunkr.Cable.create({
+--       a = { body = tower, position = topAnchor },
+--       b = { body = deck, position = deckAnchor },   -- or { part = p } / { position = p }
+--       segments = 10, thickness = 0.35, slack = 0.15,
+--   })
+--   cable:CutNear(sawTip, 1.5)     -- sever the nearest link
+--   Chunkr.Cable.cutSphere(world, blastPos, radius)   -- cut every cable in range
+--   Chunkr.Cable.autowire(world)   -- carves/explosions auto-sever cables they cross
+--
+-- Body endpoints ride the Joint layer: they follow their voxel through
+-- rebuilds/splits and BREAK when that voxel is destroyed (blast the anchor
+-- point and the cable lets go on its own). Part/world endpoints pin to a fixed
+-- host. Segments are ChunkrIgnore, so destruction ops don't voxelize them -
+-- cutting goes through CutNear / cutSphere / autowire. Server only.
+
+local Signal = require(script.Parent.Parent._Packages.Signal)
+local Joint = require(script.Parent.Joint)
+local Bin = require(script.Parent.Parent._Utility.Bin)
+local Events = require(script.Parent.Parent._Utility.Events)
+
+local Cable = {}
+local CableProto = {}
+CableProto.__index = CableProto
+
+export type Endpoint = {
+	body: any?,
+	part: BasePart?,
+	position: Vector3,
+}
+
+export type CreateOptions = {
+	a: Endpoint,
+	b: Endpoint,
+	-- Number of physical segments (default scales with span). More = smoother
+	-- sag, heavier sim.
+	segments: number?,
+	thickness: number?,
+	-- Extra rope length as a fraction of the straight span - how much it droops.
+	slack: number?,
+	color: Color3?,
+	material: Enum.Material?,
+	-- Segments don't weigh on the bodies they connect (a decorative cable that
+	-- doesn't drag a door down).
+	massless: boolean?,
+	-- Segments collide with the world (drape over things). Default false.
+	collide: boolean?,
+}
+
+type Link = {
+	sever: () -> (),
+	pos: () -> Vector3,
+	cut: boolean,
+}
+
+export type Cable = typeof(setmetatable(
+	{} :: {
+		id: number,
+		model: Model,
+		segments: { BasePart },
+		joints: { any },
+		OnCut: typeof(Signal.new()),
+		destroyed: boolean,
+		_links: { Link },
+	},
+	CableProto
+))
+
+local active: { Cable } = {}
+local nextId = 0
+local autowired = false
+
+-- ---------------------------------------------------------------- build
+
+local function makeSegment(model: Model, center: Vector3, dir: Vector3, length: number, thickness: number, options: CreateOptions): BasePart
+	local part = Instance.new("Part")
+	part.Name = "CableSegment"
+	part.Size = Vector3.new(thickness, thickness, length)
+	part.CFrame = CFrame.lookAt(center, center + dir)
+	part.Anchored = false
+	part.CanCollide = options.collide == true
+	part.CanQuery = false
+	part.Massless = options.massless == true
+	part.Color = options.color or Color3.fromRGB(45, 45, 50)
+	part.Material = options.material or Enum.Material.Metal
+	part.CustomPhysicalProperties = PhysicalProperties.new(2, 0.4, 0.3)
+	part:SetAttribute("ChunkrIgnore", true)
+	part.Parent = model
+	return part
+end
+
+local function centerAttachment(part: BasePart): Attachment
+	local attachment = Instance.new("Attachment")
+	attachment.Parent = part
+	return attachment
+end
+
+local function rope(a: Attachment, b: Attachment, length: number): RopeConstraint
+	local constraint = Instance.new("RopeConstraint")
+	constraint.Attachment0 = a
+	constraint.Attachment1 = b
+	constraint.Length = length
+	constraint.Visible = false
+	constraint.Parent = a.Parent
+	return constraint
+end
+
+-- End link A/B: a Joint when the endpoint is a body (rides its anchor, breaks
+-- on voxel death), else a plain rope to a fixed host (part or world pin).
+local function linkEnd(self: Cable, model: Model, endpoint: Endpoint, segment: BasePart): Link?
+	local segAtt = centerAttachment(segment)
+	local gap = (endpoint.position - segment.Position).Magnitude
+	if endpoint.body then
+		local joint = Joint.create({
+			kind = "Rope",
+			bodyA = endpoint.body,
+			positionA = endpoint.position,
+			partB = segment,
+			positionB = segment.Position,
+			props = { Length = math.max(gap, 0.1) },
+		})
+		if not joint then
+			return nil
+		end
+		table.insert(self.joints, joint)
+		return {
+			cut = false,
+			pos = function()
+				return endpoint.position
+			end,
+			sever = function()
+				joint:Break()
+			end,
+		}
+	end
+
+	-- Fixed host: an existing part, or an anchored invisible pin at the point.
+	local host: BasePart
+	if endpoint.part then
+		host = endpoint.part
+	else
+		local pin = Instance.new("Part")
+		pin.Name = "CablePin"
+		pin.Size = Vector3.one * 0.2
+		pin.Transparency = 1
+		pin.Anchored = true
+		pin.CanCollide = false
+		pin.CanQuery = false
+		pin.CFrame = CFrame.new(endpoint.position)
+		pin:SetAttribute("ChunkrIgnore", true)
+		pin.Parent = model
+		host = pin
+	end
+	local hostAtt = Instance.new("Attachment")
+	hostAtt.WorldPosition = endpoint.position
+	hostAtt.Parent = host
+	local constraint = rope(hostAtt, segAtt, math.max(gap, 0.1))
+	return {
+		cut = false,
+		pos = function()
+			return hostAtt.WorldPosition
+		end,
+		sever = function()
+			constraint:Destroy()
+		end,
+	}
+end
+
+function Cable.create(options: CreateOptions): Cable?
+	local posA, posB = options.a.position, options.b.position
+	local span = (posB - posA).Magnitude
+	if span < 1e-2 then
+		return nil
+	end
+	local dir = (posB - posA).Unit
+	local segCount = options.segments or math.clamp(math.round(span / 2), 3, 24)
+	local thickness = options.thickness or 0.3
+	local slack = options.slack or 0.12
+	local segStep = span / segCount
+
+	nextId += 1
+	local model = Instance.new("Model")
+	model.Name = `ChunkrCable_{nextId}`
+	model.Parent = Bin.chunks()
+
+	local self: Cable = setmetatable({
+		id = nextId,
+		model = model,
+		segments = {},
+		joints = {},
+		OnCut = Signal.new(),
+		destroyed = false,
+		_links = {},
+	}, CableProto)
+
+	-- Segments along the straight line; rope slack lets them sag.
+	local atts: { Attachment } = {}
+	for i = 1, segCount do
+		local center = posA + dir * ((i - 0.5) * segStep)
+		local segment = makeSegment(model, center, dir, segStep * 0.9, thickness, options)
+		self.segments[i] = segment
+		atts[i] = centerAttachment(segment)
+	end
+
+	-- Middle links: rope between consecutive segment centres.
+	for i = 1, segCount - 1 do
+		local constraint = rope(atts[i], atts[i + 1], segStep * (1 + slack))
+		local a, b = self.segments[i], self.segments[i + 1]
+		table.insert(self._links, {
+			cut = false,
+			pos = function()
+				return (a.Position + b.Position) / 2
+			end,
+			sever = function()
+				constraint:Destroy()
+			end,
+		})
+	end
+
+	-- End links (bookend the middle links so nearest-search covers the ends).
+	local endA = linkEnd(self, model, options.a, self.segments[1])
+	local endB = linkEnd(self, model, options.b, self.segments[segCount])
+	if not (endA and endB) then
+		self:Destroy()
+		return nil
+	end
+	table.insert(self._links, 1, endA)
+	table.insert(self._links, endB)
+
+	table.insert(active, self)
+	return self
+end
+
+-- ---------------------------------------------------------------- cut
+
+-- Sever the nearest intact link within `radius` studs of a world point.
+-- Returns whether anything was cut.
+function CableProto.CutNear(self: Cable, position: Vector3, radius: number): boolean
+	if self.destroyed then
+		return false
+	end
+	local best: Link? = nil
+	local bestD = radius
+	for _, link in self._links do
+		if link.cut then
+			continue
+		end
+		local d = (link.pos() - position).Magnitude
+		if d <= bestD then
+			bestD = d
+			best = link
+		end
+	end
+	if not best then
+		return false
+	end
+	best.cut = true
+	best.sever()
+	self.OnCut:Fire(self, position)
+	return true
+end
+
+function CableProto.Destroy(self: Cable)
+	if self.destroyed then
+		return
+	end
+	self.destroyed = true
+	for _, joint in self.joints do
+		joint:Destroy()
+	end
+	self.model:Destroy()
+	self.OnCut:DisconnectAll()
+	local index = table.find(active, self)
+	if index then
+		table.remove(active, index)
+	end
+end
+
+-- ---------------------------------------------------------------- statics
+
+-- Cut every cable with a link inside the sphere (blast/AoE severing).
+function Cable.cutSphere(position: Vector3, radius: number): number
+	local cut = 0
+	for i = #active, 1, -1 do
+		if active[i]:CutNear(position, radius) then
+			cut += 1
+		end
+	end
+	return cut
+end
+
+-- Make carves/cuts/explosions sever cables they pass through, for free.
+function Cable.autowire(world: any)
+	if autowired then
+		return
+	end
+	autowired = true
+	Events.OnCarve:Connect(function(_body, position, radius, _removed)
+		Cable.cutSphere(position, (radius or 0) + 0.75)
+	end)
+end
+
+return Cable
+]])
 mod("FracturePattern", _2, [[
 --!native
 -- A crack pattern: a boolean voxel volume where true means "delete this
@@ -1257,6 +1619,8 @@ mod("Joint", _2, [[
 -- slack (constraint re-links on the fragment's OnBodyRebuilt). Joints are
 -- not captured in Snapshots. Server only.
 
+local CollectionService = game:GetService("CollectionService")
+
 local Signal = require(script.Parent.Parent._Packages.Signal)
 local Body = require(script.Parent.Body)
 local Anchor = require(script.Parent.Anchor)
@@ -1332,11 +1696,13 @@ local function frameAlong(position: Vector3, axis: Vector3?): CFrame
 	return CFrame.fromMatrix(position, x, y, z)
 end
 
--- The assembly Part whose box contains this voxel's centre.
+-- The assembly Part whose box contains this voxel's centre. Only real chunk
+-- parts count - decorative overlays (relief tiles, marks, x-ray ghosts) share
+-- the model but must never host a joint.
 local function containingPart(body: Body.Body, x: number, y: number, z: number): BasePart?
 	local worldPos = body:LocalToWorld(x, y, z)
 	for _, part in body.model:GetChildren() do
-		if part:IsA("BasePart") then
+		if part:IsA("BasePart") and CollectionService:HasTag(part, Body.PART_TAG) then
 			local lp = part.CFrame:PointToObjectSpace(worldPos)
 			local h = part.Size / 2 + Vector3.one * 1e-3
 			if math.abs(lp.X) <= h.X and math.abs(lp.Y) <= h.Y and math.abs(lp.Z) <= h.Z then
@@ -2162,6 +2528,303 @@ end
 
 return Fx
 ]])
+mod("Marks", _3, [[
+-- Persistent per-voxel marks: spray paint, scorch, blood, bullet holes that
+-- STICK to a surface and survive the engine's churn. A mark is stored against
+-- a voxel + face, and re-rendered on every OnBodyRebuilt (exactly like Relief),
+-- so carving and splitting a wall keeps the paint on whatever's left standing.
+--
+--   Chunkr.Marks.paint(world, origin, direction, 200, { kind = "paint", color = c })
+--   Chunkr.Marks.stamp(body, worldPos, worldNormal, { kind = "scorch" })
+--   Chunkr.Marks.clear(body)
+--
+-- Kinds (paint/scorch/blood/hole) carry default colours and sizes; pass color/
+-- size to override, or textureId for a real Decal splat (e.g. a bullet-hole
+-- image). Marks are overlay parts - CanCollide/CanQuery off - so shots pass
+-- through to the voxels underneath. A mark vanishes when its host voxel is
+-- destroyed (the damage that removes the wall removes the paint on it).
+--
+-- v1: marks live on the body they were stamped on; a voxel that migrates to a
+-- split fragment drops its marks. Server only.
+
+local CollectionService = game:GetService("CollectionService")
+
+local Events = require(script.Parent.Parent._Utility.Events)
+
+local Marks = {}
+
+Marks.TAG = "ChunkrMark"
+
+export type Kind = "paint" | "scorch" | "blood" | "hole"
+
+export type Options = {
+	kind: Kind?,
+	color: Color3?,
+	-- Splat size in studs (can span more than one voxel for a splattier look).
+	size: number?,
+	-- Optional Decal image; without it the mark is a flat colour patch.
+	textureId: string?,
+}
+
+type Mark = {
+	x: number,
+	y: number,
+	z: number,
+	axis: "X" | "Y" | "Z",
+	sign: number,
+	kind: Kind,
+	color: Color3,
+	size: number,
+	textureId: string?,
+}
+
+local KIND_COLOR: { [string]: Color3 } = {
+	paint = Color3.fromRGB(230, 230, 235),
+	scorch = Color3.fromRGB(26, 23, 20),
+	blood = Color3.fromRGB(96, 10, 10),
+	hole = Color3.fromRGB(14, 14, 16),
+}
+local KIND_SIZE: { [string]: number } = {
+	paint = 1.4,
+	scorch = 1.7,
+	blood = 1.2,
+	hole = 0.6,
+}
+
+local PROUD = 0.03
+local THIN = 0.05
+
+-- ---------------------------------------------------------------- geometry
+
+local FACES = {
+	{ axis = "X", sign = 1, n = Vector3.new(1, 0, 0) },
+	{ axis = "X", sign = -1, n = Vector3.new(-1, 0, 0) },
+	{ axis = "Y", sign = 1, n = Vector3.new(0, 1, 0) },
+	{ axis = "Y", sign = -1, n = Vector3.new(0, -1, 0) },
+	{ axis = "Z", sign = 1, n = Vector3.new(0, 0, 1) },
+	{ axis = "Z", sign = -1, n = Vector3.new(0, 0, -1) },
+}
+
+local AXIS = {
+	X = { unit = Vector3.xAxis, u = Vector3.zAxis, v = Vector3.yAxis },
+	Y = { unit = Vector3.yAxis, u = Vector3.xAxis, v = Vector3.zAxis },
+	Z = { unit = Vector3.zAxis, u = Vector3.xAxis, v = Vector3.yAxis },
+}
+
+-- Along-axis / u / v voxel coordinates for a face axis.
+local function coords(axis: string, x: number, y: number, z: number): (number, number, number)
+	if axis == "X" then
+		return x, z, y
+	elseif axis == "Y" then
+		return y, x, z
+	end
+	return z, x, y
+end
+
+-- Pick the solid voxel just inside a surface hit.
+local function resolveVoxel(body: any, worldPos: Vector3, localOutward: Vector3): (number?, number?, number?)
+	local volume = body.volume
+	local px, py, pz = body:WorldToLocal(worldPos)
+	local candidates = {
+		{ math.floor(px - 0.5 * localOutward.X), math.floor(py - 0.5 * localOutward.Y), math.floor(pz - 0.5 * localOutward.Z) },
+		{ math.floor(px), math.floor(py), math.floor(pz) },
+	}
+	for _, c in candidates do
+		if volume:GetSafe(c[1], c[2], c[3]) ~= 0 then
+			return c[1], c[2], c[3]
+		end
+	end
+	-- Last resort: nearest solid in the 3x3x3 around the hit.
+	local bx, by, bz = math.floor(px), math.floor(py), math.floor(pz)
+	local best, bestD = nil, math.huge
+	for dx = -1, 1 do
+		for dy = -1, 1 do
+			for dz = -1, 1 do
+				local x, y, z = bx + dx, by + dy, bz + dz
+				if volume:GetSafe(x, y, z) ~= 0 then
+					local d = (Vector3.new(x + 0.5, y + 0.5, z + 0.5) - Vector3.new(px, py, pz)).Magnitude
+					if d < bestD then
+						bestD, best = d, { x, y, z }
+					end
+				end
+			end
+		end
+	end
+	if best then
+		return best[1], best[2], best[3]
+	end
+	return nil, nil, nil
+end
+
+-- Choose the exposed face of a voxel that best faces `localOutward`.
+local function resolveFace(body: any, x: number, y: number, z: number, localOutward: Vector3): (string?, number?)
+	local volume = body.volume
+	local best, bestScore = nil, -math.huge
+	for _, face in FACES do
+		if volume:GetSafe(x + face.n.X, y + face.n.Y, z + face.n.Z) == 0 then
+			local score = face.n:Dot(localOutward)
+			if score > bestScore then
+				bestScore, best = score, face
+			end
+		end
+	end
+	if best then
+		return best.axis, best.sign
+	end
+	return nil, nil
+end
+
+-- ---------------------------------------------------------------- render
+
+local function buildPart(body: any, mark: Mark): Part?
+	local volume = body.volume
+	if volume:GetSafe(mark.x, mark.y, mark.z) == 0 then
+		return nil
+	end
+	local n = AXIS[mark.axis].unit * mark.sign
+	if volume:GetSafe(mark.x + n.X, mark.y + n.Y, mark.z + n.Z) ~= 0 then
+		return nil -- face got buried
+	end
+
+	local vs = body.voxelSize
+	local basis = AXIS[mark.axis]
+	local planeCoord, uCoord, vCoord = coords(mark.axis, mark.x, mark.y, mark.z)
+	local planeValue = if mark.sign > 0 then (planeCoord + 1) * vs else planeCoord * vs
+	local localCenter = basis.unit * (planeValue + mark.sign * (PROUD + THIN / 2))
+		+ basis.u * ((uCoord + 0.5) * vs)
+		+ basis.v * ((vCoord + 0.5) * vs)
+
+	local part = Instance.new("Part")
+	part.Name = "Mark"
+	part.Size = Vector3.new(mark.size, mark.size, THIN)
+	part.CFrame = body:GetPivot() * CFrame.fromMatrix(localCenter, basis.u, basis.v)
+	part.Anchored = body.anchored
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.CastShadow = false
+	part.Massless = true
+	part.Color = mark.color
+	part.Material = if mark.kind == "hole" then Enum.Material.Slate else Enum.Material.SmoothPlastic
+	if mark.textureId then
+		for _, faceId in { Enum.NormalId.Front, Enum.NormalId.Back } do
+			local decal = Instance.new("Decal")
+			decal.Texture = mark.textureId
+			decal.Face = faceId
+			decal.Color3 = mark.color
+			decal.Parent = part
+		end
+	end
+	CollectionService:AddTag(part, Marks.TAG)
+	if not body.anchored then
+		local weld = Instance.new("WeldConstraint")
+		weld.Part0 = body.rootPart
+		weld.Part1 = part
+		weld.Parent = part
+	end
+	part.Parent = body.model
+	return part
+end
+
+-- ---------------------------------------------------------------- store
+
+local registry: { [any]: { Mark } } = {}
+local hooked = false
+
+local function ensureHook()
+	if hooked then
+		return
+	end
+	hooked = true
+	Events.OnBodyRebuilt:Connect(function(body)
+		local marks = registry[body]
+		if not marks then
+			return
+		end
+		-- Rebuild wiped the old mark parts with the rest of the model; re-lay
+		-- the ones whose voxel + face are still there, prune the rest.
+		for i = #marks, 1, -1 do
+			if not buildPart(body, marks[i]) then
+				table.remove(marks, i)
+			end
+		end
+		if #marks == 0 then
+			registry[body] = nil
+		end
+	end)
+	Events.OnBodyRemoved:Connect(function(body)
+		registry[body] = nil
+	end)
+end
+
+-- ---------------------------------------------------------------- API
+
+-- Stamp a mark on a body at a world-space surface point + outward normal.
+-- Returns false if there's nothing solid there to mark.
+function Marks.stamp(body: any, worldPos: Vector3, worldNormal: Vector3, options: Options?): boolean
+	if body.destroyed then
+		return false
+	end
+	ensureHook()
+	local opts = options or {}
+	local kind = opts.kind or "paint"
+	local localOutward = body:WorldToLocalDirection(worldNormal)
+	if localOutward.Magnitude < 1e-4 then
+		localOutward = Vector3.yAxis
+	else
+		localOutward = localOutward.Unit
+	end
+	local vx, vy, vz = resolveVoxel(body, worldPos, localOutward)
+	if vx == nil then
+		return false
+	end
+	local axis, sign = resolveFace(body, vx :: number, vy :: number, vz :: number, localOutward)
+	if axis == nil then
+		return false
+	end
+	local mark: Mark = {
+		x = vx :: number,
+		y = vy :: number,
+		z = vz :: number,
+		axis = axis :: any,
+		sign = sign :: number,
+		kind = kind,
+		color = opts.color or KIND_COLOR[kind] or KIND_COLOR.paint,
+		size = opts.size or KIND_SIZE[kind] or 1.2,
+		textureId = opts.textureId,
+	}
+	local marks = registry[body]
+	if not marks then
+		marks = {}
+		registry[body] = marks
+	end
+	table.insert(marks, mark)
+	buildPart(body, mark)
+	return true
+end
+
+-- Fire a ray into the world and mark whatever it hits. Returns whether it
+-- stuck. `direction` need not be unit; `maxDistance` in studs.
+function Marks.paint(world: any, origin: Vector3, direction: Vector3, maxDistance: number, options: Options?): boolean
+	local hit = world:Raycast(origin, direction.Unit, maxDistance)
+	if not hit then
+		return false
+	end
+	return Marks.stamp(hit.body, hit.position, -direction.Unit, options)
+end
+
+-- Drop every mark on a body.
+function Marks.clear(body: any)
+	registry[body] = nil
+	for _, child in body.model:GetChildren() do
+		if child:IsA("BasePart") and CollectionService:HasTag(child, Marks.TAG) then
+			child:Destroy()
+		end
+	end
+end
+
+return Marks
+]])
 mod("Network", _3, [[
 -- Op transport over Substance. Two channels:
 --   ChunkrOp (Strict, client -> server): tool requests, validated hard.
@@ -2257,6 +2920,10 @@ function Network.startServer(world: any, config: any)
 	end)
 	Events.OnBurnout:Connect(function(_body, count, position)
 		Dispatch.Broadcast(FX, { t = "burnout", p = position, n = count })
+	end)
+	Events.OnVaporIgnite:Connect(function(position, _kind)
+		-- A gas flash reads as a burst of fire on clients.
+		Dispatch.Broadcast(FX, { t = "ignite", p = position, n = 1 })
 	end)
 	Events.OnSplit:Connect(function(body, fragments)
 		Dispatch.Broadcast(FX, { t = "split", p = body:GetPivot().Position, n = #fragments })
@@ -2819,6 +3486,7 @@ local Materials = require(script.Parent.Parent._Patterns.Materials)
 local Fracture = require(script.Parent.Parent._Patterns.Fracture)
 local Impact = require(script.Parent.Parent._Patterns.Impact)
 local Fire = require(script.Parent.Parent._Patterns.Fire)
+local Vapor = require(script.Parent.Parent._Patterns.Vapor)
 local Carve = require(script.Parent.Parent._Patterns.Carve)
 local Debris = require(script.Parent.Parent._Patterns.Debris)
 local Topology = require(script.Parent.Parent._Patterns.Topology)
@@ -3122,6 +3790,12 @@ local function step(world: any)
 	-- feed step 2's topology next tick, so burnt-through pieces drop).
 	if config.fire.enabled then
 		Fire.step(world)
+	end
+
+	-- 3.6. Vapor: gas flows/rises/decays, flammable gas flashes (the flash
+	-- is a real explosion, so it re-enters the destruction path).
+	if config.vapor.enabled then
+		Vapor.step(world)
 	end
 
 	-- 4. Anchors ride their (possibly moving) bodies.
@@ -3670,6 +4344,8 @@ local Fracture = require(script.Parent.Parent._Patterns.Fracture)
 local Impact = require(script.Parent.Parent._Patterns.Impact)
 local Adopt = require(script.Parent.Parent._Patterns.Adopt)
 local Fire = require(script.Parent.Parent._Patterns.Fire)
+local Vapor = require(script.Parent.Parent._Patterns.Vapor)
+local Marks = require(script.Parent.Marks)
 local Bin = require(script.Parent.Parent._Utility.Bin)
 local Raycast = require(script.Parent.Parent._Utility.Raycast)
 local Persist = require(script.Parent.Parent._Utility.Persist)
@@ -3685,6 +4361,10 @@ export type World = typeof(setmetatable(
 	{} :: {
 		bodies: { [number]: Body.Body },
 		config: any,
+		-- Vapor sim state (owned by Patterns/Vapor; declared here so no caller
+		-- needs an `:: any` cast to reach it).
+		_vapor: any?,
+		_vaporWired: boolean?,
 	},
 	World
 ))
@@ -3890,7 +4570,35 @@ function World.Explode(self: World, position: Vector3, radiusStuds: number, powe
 	if fire.enabled and fire.igniteFromExplosions then
 		Fire.igniteSphere(self, position, radiusStuds * fire.explosionIgniteScale)
 	end
+	-- ...kick up a dust cloud and try to touch off any gas in the blast.
+	local vapor = self.config.vapor
+	if vapor.enabled and vapor.emitFromExplosions then
+		Vapor.emit(self, position, "dust", vapor.explosionDust)
+		Vapor.spark(self, position, radiusStuds)
+	end
 	return removed
+end
+
+-- ---------------------------------------------------------------- vapor / marks
+
+-- Add gas of a kind ("smoke"/"steam"/"dust"/"gas") at a world point.
+function World.Vent(self: World, position: Vector3, kind: string, amount: number)
+	Vapor.emit(self, position, kind, amount)
+end
+
+-- Release flammable gas (shorthand for Vent(..., "gas", ...)).
+function World.LeakGas(self: World, position: Vector3, amount: number)
+	Vapor.emit(self, position, "gas", amount)
+end
+
+-- Ignite flammable gas within radius (default ~1.5 cells). Returns cells lit.
+function World.Spark(self: World, position: Vector3, radius: number?): number
+	return Vapor.spark(self, position, radius or self.config.vapor.cellSize * 1.5)
+end
+
+-- Raycast into the world and stamp a persistent mark where it hits.
+function World.Paint(self: World, origin: Vector3, direction: Vector3, maxDistance: number, options: Marks.Options?): boolean
+	return Marks.paint(self, origin, direction, maxDistance, options)
 end
 
 -- Lights every flammable voxel in the sphere; plain parts in reach are
@@ -4127,6 +4835,182 @@ function World.Destroy(self: World)
 end
 
 return World
+]])
+mod("Xray", _3, [[
+-- Stress x-ray: an engineer-vision overlay that colours a structure by how
+-- close each voxel is to failing, so you can SEE why it's about to pancake.
+-- Green = comfortable, yellow = loaded, red = at/over capacity.
+--
+--   Chunkr.Xray.show(world)   -- ghosts every anchored body by stress
+--   Chunkr.Xray.hide()
+--
+-- Reuses the exact stress solver the collapse runs on (Stress.field), so the
+-- overlay is ground truth, not a guess. Each rendered box gets one translucent
+-- Neon ghost tinted by the stress at its centre; the overlay rebuilds on every
+-- OnBodyRebuilt, so it tracks damage as you carve. Dev/diagnostic tool - the
+-- ghosts are server parts that replicate, so it also reads in a server test.
+
+local CollectionService = game:GetService("CollectionService")
+
+local Materials = require(script.Parent.Parent._Patterns.Materials)
+local Stress = require(script.Parent.Parent._Patterns.Stress)
+local Body = require(script.Parent.Parent._Classes.Body)
+local Events = require(script.Parent.Parent._Utility.Events)
+
+local Xray = {}
+
+Xray.TAG = "ChunkrXray"
+
+local GREEN = Color3.fromRGB(50, 205, 90)
+local YELLOW = Color3.fromRGB(235, 220, 40)
+local RED = Color3.fromRGB(235, 45, 45)
+
+local world: any = nil
+local config: any = { loadFactor = 8, crushFactor = 55 }
+local enabled = false
+local hooked = false
+
+-- ---------------------------------------------------------------- colour
+
+local function severityColor(s: number): Color3
+	if s <= 0.7 then
+		return GREEN:Lerp(YELLOW, math.clamp(s / 0.7, 0, 1))
+	end
+	return YELLOW:Lerp(RED, math.clamp((s - 0.7) / 0.3, 0, 1))
+end
+
+-- ---------------------------------------------------------------- luts
+
+local function strengthLut(): { [number]: number }
+	local lut = {}
+	for id, material in Materials.all() do
+		lut[id] = material.strength
+	end
+	return lut
+end
+
+local function densityLut(): { [number]: number }
+	local lut = {}
+	for id, material in Materials.all() do
+		lut[id] = material.density
+	end
+	return lut
+end
+
+-- ---------------------------------------------------------------- overlay
+
+local function clear(body: any)
+	for _, child in body.model:GetChildren() do
+		if child:IsA("BasePart") and CollectionService:HasTag(child, Xray.TAG) then
+			child:Destroy()
+		end
+	end
+end
+
+local function refresh(body: any)
+	clear(body)
+	if not enabled or body.destroyed or not body.anchored or not body.rootPart then
+		return
+	end
+	local volume = body.volume
+	local sx, sy, sz = volume.sx, volume.sy, volume.sz
+	local sxsz = sx * sz
+
+	local seeds = {}
+	for z = 0, sz - 1 do
+		for x = 0, sx - 1 do
+			if volume:Get(x, 0, z) ~= 0 then
+				table.insert(seeds, x + z * sx)
+			end
+		end
+	end
+	if #seeds == 0 then
+		return
+	end
+
+	local field = Stress.field(volume.voxels, sx, sy, sz, seeds, strengthLut(), config.loadFactor, densityLut(), config.crushFactor)
+
+	for _, part in body.model:GetChildren() do
+		if not (part:IsA("BasePart") and CollectionService:HasTag(part, Body.PART_TAG)) then
+			continue
+		end
+		-- Sample the field at the box's centre voxel.
+		local lx, ly, lz = body:WorldToLocal(part.Position)
+		local x = math.clamp(math.floor(lx), 0, sx - 1)
+		local y = math.clamp(math.floor(ly), 0, sy - 1)
+		local z = math.clamp(math.floor(lz), 0, sz - 1)
+		local severity = buffer.readf32(field, (x + z * sx + y * sxsz) * 4)
+
+		local ghost = Instance.new("Part")
+		ghost.Name = "Xray"
+		ghost.Size = part.Size * 1.03
+		ghost.CFrame = part.CFrame
+		ghost.Anchored = body.anchored
+		ghost.CanCollide = false
+		ghost.CanQuery = false
+		ghost.CanTouch = false
+		ghost.CastShadow = false
+		ghost.Massless = true
+		ghost.Material = Enum.Material.Neon
+		ghost.Color = severityColor(severity)
+		ghost.Transparency = 0.55
+		CollectionService:AddTag(ghost, Xray.TAG)
+		if not body.anchored then
+			local weld = Instance.new("WeldConstraint")
+			weld.Part0 = part
+			weld.Part1 = ghost
+			weld.Parent = ghost
+		end
+		ghost.Parent = body.model
+	end
+end
+
+local function ensureHook()
+	if hooked then
+		return
+	end
+	hooked = true
+	-- Rebuild wiped this body's ghosts along with its parts; re-tint on the
+	-- fresh geometry (stress only changes when the volume changes anyway).
+	Events.OnBodyRebuilt:Connect(function(body)
+		if enabled then
+			refresh(body)
+		end
+	end)
+end
+
+-- ---------------------------------------------------------------- API
+
+function Xray.configure(stress: any)
+	if stress then
+		config = { loadFactor = stress.loadFactor, crushFactor = stress.crushFactor }
+	end
+end
+
+-- Turn the overlay on for a world. Idempotent.
+function Xray.show(target: any)
+	world = target
+	enabled = true
+	ensureHook()
+	for _, body in world:Bodies() do
+		refresh(body)
+	end
+end
+
+function Xray.hide()
+	enabled = false
+	if world then
+		for _, body in world:Bodies() do
+			clear(body)
+		end
+	end
+end
+
+function Xray.isShown(): boolean
+	return enabled
+end
+
+return Xray
 ]])
 local _5 = folder("_Packages", _1)
 mod("Promise", _5, [==[
@@ -12947,6 +13831,136 @@ function Stress.unsupported(
 	return broken, warnings
 end
 
+-- Diagnostic field for the x-ray overlay: per-voxel severity = load/capacity
+-- (max of the span and crush ratios), so callers can colour a structure by
+-- how close each voxel is to failing. Same physics as unsupported(), but it
+-- records ratios for EVERY solid voxel instead of just the failures. Returns
+-- an f32 buffer (one per voxel; 0 for air). >= 1 means already failing.
+-- Main-thread diagnostic - not on the worker path.
+function Stress.field(
+	voxels: buffer,
+	sx: number,
+	sy: number,
+	sz: number,
+	seeds: { number },
+	strengthLut: { [number]: number },
+	loadFactor: number,
+	densityLut: { [number]: number }?,
+	crushFactor: number?
+): buffer
+	local total = sx * sy * sz
+	local sxsz = sx * sz
+	local dist = buffer.create(total * 2)
+	buffer.fill(dist, 0, 0xFF)
+
+	local maxCapacity = 0
+	for _, strength in strengthLut do
+		local capacity = strength * loadFactor
+		if capacity > maxCapacity then
+			maxCapacity = capacity
+		end
+	end
+	local maxD = math.min(math.floor(maxCapacity) + 1, UNREACHED - 1)
+
+	local buckets: { { number } } = {}
+	for d = 0, maxD do
+		buckets[d] = {}
+	end
+	for _, index in seeds do
+		if buffer.readu16(voxels, index * 2) ~= 0 and buffer.readu16(dist, index * 2) == UNREACHED then
+			buffer.writeu16(dist, index * 2, 0)
+			table.insert(buckets[0], index)
+		end
+	end
+
+	for d = 0, maxD do
+		local bucket = buckets[d]
+		local head = 1
+		while head <= #bucket do
+			local index = bucket[head]
+			head += 1
+			if buffer.readu16(dist, index * 2) ~= d then
+				continue
+			end
+			local x = index % sx
+			local y = index // sxsz
+			local z = (index // sx) % sz
+
+			local function relax(nx: number, ny: number, nz: number, cost: number)
+				if nx < 0 or ny < 0 or nz < 0 or nx >= sx or ny >= sy or nz >= sz then
+					return
+				end
+				local nd = d + cost
+				if nd > maxD then
+					return
+				end
+				local ni = nx + nz * sx + ny * sxsz
+				if buffer.readu16(voxels, ni * 2) ~= 0 and nd < buffer.readu16(dist, ni * 2) then
+					buffer.writeu16(dist, ni * 2, nd)
+					table.insert(buckets[nd], ni)
+				end
+			end
+			local function sideCost(nx: number, ny: number, nz: number): number
+				if ny > 0 and buffer.readu16(voxels, (nx + nz * sx + (ny - 1) * sxsz) * 2) ~= 0 then
+					return 1
+				end
+				return 2
+			end
+			relax(x, y + 1, z, 0)
+			if x > 0 then
+				relax(x - 1, y, z, sideCost(x - 1, y, z))
+			end
+			if x + 1 < sx then
+				relax(x + 1, y, z, sideCost(x + 1, y, z))
+			end
+			if z > 0 then
+				relax(x, y, z - 1, sideCost(x, y, z - 1))
+			end
+			if z + 1 < sz then
+				relax(x, y, z + 1, sideCost(x, y, z + 1))
+			end
+			relax(x, y - 1, z, 2)
+		end
+	end
+
+	local field = buffer.create(total * 4)
+	for index = 0, total - 1 do
+		local id = buffer.readu16(voxels, index * 2)
+		if id == 0 then
+			continue
+		end
+		local capacity = (strengthLut[id] or 0) * loadFactor
+		local d = buffer.readu16(dist, index * 2)
+		local ratio = if d == UNREACHED then 1.5 elseif capacity > 0 then d / capacity else 0
+		buffer.writef32(field, index * 4, ratio)
+	end
+
+	-- Crush pass folds in the compression ratio (take the worse of the two).
+	if densityLut and crushFactor then
+		for z = 0, sz - 1 do
+			for x = 0, sx - 1 do
+				local load = 0
+				for y = sy - 1, 0, -1 do
+					local index = x + z * sx + y * sxsz
+					local id = buffer.readu16(voxels, index * 2)
+					if id == 0 then
+						load = 0
+						continue
+					end
+					local capacity = (strengthLut[id] or 0) * crushFactor
+					local ratio = if capacity > 0 then load / capacity else 0
+					if ratio > buffer.readf32(field, index * 4) then
+						buffer.writef32(field, index * 4, ratio)
+					end
+					load += densityLut[id] or 0
+				end
+			end
+		end
+	end
+
+	return field
+end
+
 return Stress
 ]])
 mod("Topology", _12, [[
@@ -13067,6 +14081,316 @@ function Topology.islands(voxels: buffer, sx: number, sy: number, sz: number, la
 end
 
 return Topology
+]])
+mod("Vapor", _12, [[
+-- Vapor: a coarse gas simulation - smoke, steam, dust, and flammable gas that
+-- flow, rise or settle, thin out, and (for gas) IGNITE and chain into flashes.
+-- Fills the spaces your destruction opens up and turns a gas leak next to a
+-- fire into a bomb.
+--
+--   world:Vent(position, "smoke", 2)     -- add gas of a kind at a point
+--   world:LeakGas(position, 3)           -- flammable gas (shorthand for "gas")
+--   world:Spark(position, 4)             -- ignite gas in range -> flash + chain
+--   Chunkr.Vapor.autowire(world)         -- fire smokes, blasts kick up dust
+--
+-- Model: a sparse coarse grid (config.vapor.cellSize studs). Each tick every
+-- cell diffuses a fraction to its neighbours with a vertical bias (smoke/steam
+-- rise, dust settles), then decays. Gas cells flagged ignited flash: a small
+-- world:Explode at the cell (which damages, adopts, and lights nearby
+-- flammables) and the neighbouring gas is marked to flash next tick. Ignition
+-- comes from world:Spark, from explosions, and from fire meeting a gas cell.
+--
+-- The core sim (Vapor._diffuse / Vapor._ignite) is pure - plain cell tables,
+-- no Roblox types - so it's unit-tested headless. Render is pooled server
+-- Smoke parts (they replicate, so a server playtest shows the gas). Server only.
+
+local Events = require(script.Parent.Parent._Utility.Events)
+local Bin = require(script.Parent.Parent._Utility.Bin)
+
+local Vapor = {}
+
+-- Per-kind behaviour. rise > 0 buoyant (rises), < 0 settles. rgb is a plain
+-- tuple so this module loads with no Roblox datatypes (headless-safe).
+local KINDS: { [string]: { rise: number, decay: number, flammable: boolean, rgb: { number } } } = {
+	smoke = { rise = 1.0, decay = 0.12, flammable = false, rgb = { 70, 68, 64 } },
+	steam = { rise = 1.4, decay = 0.22, flammable = false, rgb = { 226, 229, 233 } },
+	dust = { rise = -0.35, decay = 0.14, flammable = false, rgb = { 150, 138, 120 } },
+	gas = { rise = 0.25, decay = 0.05, flammable = true, rgb = { 140, 170, 110 } },
+}
+
+type Cell = {
+	gx: number,
+	gy: number,
+	gz: number,
+	kind: string,
+	density: number,
+	ignited: boolean,
+}
+
+local function key(gx: number, gy: number, gz: number, kind: string): string
+	return `{gx}:{gy}:{gz}:{kind}`
+end
+
+local NEIGHBOURS = {
+	{ 1, 0, 0 },
+	{ -1, 0, 0 },
+	{ 0, 1, 0 },
+	{ 0, -1, 0 },
+	{ 0, 0, 1 },
+	{ 0, 0, -1 },
+}
+
+-- ---------------------------------------------------------------- pure sim
+
+-- One diffusion + decay step. Pure: takes and returns a { [key]: Cell } map.
+function Vapor._diffuse(cells: { [string]: Cell }, cfg: any): { [string]: Cell }
+	local out: { [string]: Cell } = {}
+
+	local function deposit(gx: number, gy: number, gz: number, kind: string, amount: number, ignited: boolean)
+		if amount <= 0 then
+			return
+		end
+		local k = key(gx, gy, gz, kind)
+		local cell = out[k]
+		if not cell then
+			cell = { gx = gx, gy = gy, gz = gz, kind = kind, density = 0, ignited = false }
+			out[k] = cell
+		end
+		cell.density += amount
+		if ignited then
+			cell.ignited = true
+		end
+	end
+
+	for _, cell in cells do
+		local kd = KINDS[cell.kind]
+		if not kd then
+			continue
+		end
+		local flow = cell.density * cfg.diffuse
+		deposit(cell.gx, cell.gy, cell.gz, cell.kind, cell.density - flow, cell.ignited)
+
+		local upW = math.max(0, 1 + cfg.buoyancy * kd.rise)
+		local downW = math.max(0, 1 - cfg.buoyancy * kd.rise)
+		local total = upW + downW + 4 -- four side neighbours, weight 1 each
+		deposit(cell.gx, cell.gy + 1, cell.gz, cell.kind, flow * upW / total, false)
+		deposit(cell.gx, cell.gy - 1, cell.gz, cell.kind, flow * downW / total, false)
+		deposit(cell.gx + 1, cell.gy, cell.gz, cell.kind, flow / total, false)
+		deposit(cell.gx - 1, cell.gy, cell.gz, cell.kind, flow / total, false)
+		deposit(cell.gx, cell.gy, cell.gz + 1, cell.kind, flow / total, false)
+		deposit(cell.gx, cell.gy, cell.gz - 1, cell.kind, flow / total, false)
+	end
+
+	-- Decay + prune the wisps.
+	local kept: { Cell } = {}
+	for k, cell in out do
+		cell.density *= 1 - KINDS[cell.kind].decay
+		if cell.density < cfg.epsilon then
+			out[k] = nil
+		else
+			table.insert(kept, cell)
+		end
+	end
+
+	-- Budget: drop the faintest cells past the cap.
+	if #kept > cfg.maxCells then
+		table.sort(kept, function(a, b)
+			return a.density < b.density
+		end)
+		for i = 1, #kept - cfg.maxCells do
+			local cell = kept[i]
+			out[key(cell.gx, cell.gy, cell.gz, cell.kind)] = nil
+		end
+	end
+
+	return out
+end
+
+-- Consume ignited flammable cells: remove them (they've flashed) and mark
+-- neighbouring gas to flash next tick. Mutates `cells`; returns the flashes.
+-- Pure (no Roblox types).
+function Vapor._ignite(cells: { [string]: Cell }): { Cell }
+	local flashes: { Cell } = {}
+	for _, cell in cells do
+		if cell.ignited and KINDS[cell.kind] and KINDS[cell.kind].flammable then
+			table.insert(flashes, cell)
+		end
+	end
+	for _, cell in flashes do
+		cells[key(cell.gx, cell.gy, cell.gz, cell.kind)] = nil
+		for _, d in NEIGHBOURS do
+			local n = cells[key(cell.gx + d[1], cell.gy + d[2], cell.gz + d[3], cell.kind)]
+			if n then
+				n.ignited = true
+			end
+		end
+	end
+	return flashes
+end
+
+-- ---------------------------------------------------------------- state
+
+local function ensureState(world: any): any
+	if not world._vapor then
+		world._vapor = { cells = {}, parts = {}, lastTick = 0 }
+	end
+	return world._vapor
+end
+
+local function cellCenter(gx: number, gy: number, gz: number, cellSize: number): Vector3
+	return Vector3.new((gx + 0.5) * cellSize, (gy + 0.5) * cellSize, (gz + 0.5) * cellSize)
+end
+
+-- ---------------------------------------------------------------- render
+
+local function ensurePart(state: any, k: string): Part
+	local part = state.parts[k]
+	if part then
+		return part
+	end
+	part = Instance.new("Part")
+	part.Name = "ChunkrVapor"
+	part.Size = Vector3.one * 0.5
+	part.Transparency = 1
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.CastShadow = false
+	part:SetAttribute("ChunkrIgnore", true)
+	local smoke = Instance.new("Smoke")
+	smoke.Parent = part
+	part.Parent = Bin.trash()
+	state.parts[k] = part
+	return part
+end
+
+local function render(state: any, cfg: any)
+	for k, cell in state.cells do
+		local part = ensurePart(state, k)
+		part.Position = cellCenter(cell.gx, cell.gy, cell.gz, cfg.cellSize)
+		local smoke = part:FindFirstChildOfClass("Smoke")
+		if smoke then
+			local kd = KINDS[cell.kind]
+			smoke.Color = Color3.fromRGB(kd.rgb[1], kd.rgb[2], kd.rgb[3])
+			smoke.Opacity = math.clamp(cell.density * 0.25, 0.05, 0.7)
+			smoke.Size = math.clamp(cell.density, 0.5, 3) * cfg.cellSize * 0.3
+			smoke.RiseVelocity = kd.rise * 3
+		end
+	end
+	for k, part in state.parts do
+		if not state.cells[k] then
+			part:Destroy()
+			state.parts[k] = nil
+		end
+	end
+end
+
+-- ---------------------------------------------------------------- API
+
+-- Add `amount` of a gas kind ("smoke"/"steam"/"dust"/"gas") at a world point.
+function Vapor.emit(world: any, position: Vector3, kind: string, amount: number)
+	local cfg = world.config.vapor
+	if not cfg.enabled or not KINDS[kind] then
+		return
+	end
+	local state = ensureState(world)
+	local gx = math.floor(position.X / cfg.cellSize)
+	local gy = math.floor(position.Y / cfg.cellSize)
+	local gz = math.floor(position.Z / cfg.cellSize)
+	local k = key(gx, gy, gz, kind)
+	local cell = state.cells[k]
+	if not cell then
+		cell = { gx = gx, gy = gy, gz = gz, kind = kind, density = 0, ignited = false }
+		state.cells[k] = cell
+	end
+	cell.density = math.min(cell.density + amount, cfg.maxDensity)
+end
+
+-- Ignite flammable gas within `radius` studs (begins a chain). Returns how
+-- many cells were lit.
+function Vapor.spark(world: any, position: Vector3, radius: number): number
+	local cfg = world.config.vapor
+	local state = world._vapor
+	if not cfg.enabled or not state then
+		return 0
+	end
+	local lit = 0
+	for _, cell in state.cells do
+		if KINDS[cell.kind] and KINDS[cell.kind].flammable and not cell.ignited then
+			if (cellCenter(cell.gx, cell.gy, cell.gz, cfg.cellSize) - position).Magnitude <= radius then
+				cell.ignited = true
+				lit += 1
+			end
+		end
+	end
+	return lit
+end
+
+-- One simulation tick: flash ignited gas, diffuse/decay, re-render.
+function Vapor.step(world: any)
+	local cfg = world.config.vapor
+	if not cfg.enabled then
+		return
+	end
+	local state = world._vapor
+	if not state then
+		return
+	end
+	local now = os.clock()
+	if now - state.lastTick < cfg.tickInterval then
+		return
+	end
+	state.lastTick = now
+
+	local flashes = Vapor._ignite(state.cells)
+	for _, cell in flashes do
+		local center = cellCenter(cell.gx, cell.gy, cell.gz, cfg.cellSize)
+		-- The flash: a real explosion, so it damages/adopts/lights around it.
+		world:Explode(center, cfg.cellSize * cfg.flashRadiusScale, cfg.flashPower)
+		Events.OnVaporIgnite:Fire(center, cell.kind)
+		-- Leave smoke behind.
+		local sk = key(cell.gx, cell.gy, cell.gz, "smoke")
+		local smoke = state.cells[sk]
+		if not smoke then
+			smoke = { gx = cell.gx, gy = cell.gy, gz = cell.gz, kind = "smoke", density = 0, ignited = false }
+			state.cells[sk] = smoke
+		end
+		smoke.density = math.max(smoke.density, 1.2)
+	end
+
+	state.cells = Vapor._diffuse(state.cells, cfg)
+	render(state, cfg)
+end
+
+-- Fire smokes, blasts kick up dust and try to touch off gas.
+function Vapor.autowire(world: any)
+	if world._vaporWired then
+		return
+	end
+	world._vaporWired = true
+	local cfg = world.config.vapor
+	Events.OnBurn:Connect(function(_body, _count, position)
+		if cfg.enabled and cfg.emitFromFire then
+			Vapor.emit(world, position + Vector3.yAxis * cfg.cellSize, "smoke", cfg.fireSmoke)
+			-- Fire meeting a gas pocket lights it.
+			Vapor.spark(world, position, cfg.cellSize)
+		end
+	end)
+end
+
+function Vapor.clear(world: any)
+	local state = world._vapor
+	if not state then
+		return
+	end
+	for _, part in state.parts do
+		part:Destroy()
+	end
+	world._vapor = nil
+end
+
+return Vapor
 ]])
 local _14 = folder("_Utility", _1)
 mod("Bin", _14, [[
@@ -13264,6 +14588,29 @@ local Config = {
 		maxVoxels = 100000, -- refuse absurd single builds
 	},
 
+	-- Vapor: coarse gas sim (smoke/steam/dust/flammable gas) that flows,
+	-- rises/settles, decays, and ignites. Ticked from Simulation.
+	vapor = {
+		enabled = true,
+		cellSize = 4, -- studs per gas cell
+		tickInterval = 0.25,
+		diffuse = 0.28, -- fraction of a cell's density that flows out per tick
+		buoyancy = 0.6, -- vertical bias strength (× the kind's rise)
+		decay = 0.14, -- baseline; per-kind decay lives in Vapor.KINDS
+		epsilon = 0.02, -- density below this is pruned
+		maxCells = 256, -- active-cell budget (faintest dropped past it)
+		maxDensity = 4, -- per-cell density cap
+		-- Gas flash when ignited: a real explosion at the cell.
+		flashPower = 6,
+		flashRadiusScale = 1.2,
+		-- Fire vents smoke and can touch off gas.
+		emitFromFire = true,
+		fireSmoke = 0.5, -- smoke density added per burning tick
+		-- Explosions kick up dust and try to ignite gas in the blast.
+		emitFromExplosions = true,
+		explosionDust = 1.5,
+	},
+
 	-- Relief: physical surface texture (proud bricks, recessed panels) tiled
 	-- from a body's exposed surface. Decorative, so it's capped hard.
 	relief = {
@@ -13321,6 +14668,8 @@ local Events = {
 	OnBurn = Signal.new(),
 	-- (body, burnedCount, positionWorld) when voxels finish burning away
 	OnBurnout = Signal.new(),
+	-- (positionWorld, kind) when a flammable vapor cell ignites and flashes
+	OnVaporIgnite = Signal.new(),
 	-- (joint) when a Joint's host voxel/part is destroyed and it gives way
 	OnJointBroken = Signal.new(),
 	-- (body) lifecycle
@@ -14277,5 +15626,5 @@ end
 return Vox
 ]])
 
-print("[Chunkr] installed 75 modules (1 scripts) under ReplicatedStorage.Chunkr")
+print("[Chunkr] installed 79 modules (1 scripts) under ReplicatedStorage.Chunkr")
 return true
