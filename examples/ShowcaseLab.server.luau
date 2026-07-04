@@ -1,21 +1,8 @@
--- Chunkr showcase: the newest systems - cables, persistent marks, the vapor
--- sim, and the stress x-ray. Each station runs in a shared arena and sweeps
--- itself with world:Reset({}) before the next.
+-- Chunkr cable lab: physical, sagging, cuttable cables - nothing else. A row
+-- of crates hangs from one stone beam, each on a cable with a different slack
+-- and thickness, so you can read how the parameters change the droop. After a
+-- beat every cable is cut and the crates drop.
 --
---   1  cables   a crate hangs from a stone beam on a physical cable, then the
---               cable is cut and the crate drops                   Cable.create
---   2  marks    paint / scorch / blood splats that STICK to a wall; then half
---               the wall is blasted and only the surviving voxels keep their
---               marks                                                world:Paint
---   3  vapor    a gas leak fills a room and a spark chain-detonates it; a
---               burning plank vents rising smoke              world:LeakGas/Spark
---   4  x-ray    a top-heavy column ghosted green->red by stress, then
---               overloaded until the base fails               Chunkr:ShowStress
---
--- Marks and vapor are server-authoritative and replicate, so this reads in a
--- plain server playtest. On clients, add cube spray to destruction with
--- Chunkr.client().fx.start({ voxels = true }).
--- Only one Chunkr example ships Enabled at a time.
 -- Requires ReplicatedStorage.Chunkr (rojo place build or dist/bootstrap.luau).
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -41,14 +28,6 @@ Chunkr.Materials.define("LabStone", {
 	renderMaterial = Enum.Material.Slate,
 	fractureTable = Chunkr.Fracture.Stock.stone(250),
 })
-Chunkr.Materials.define("LabBrick", {
-	density = 1.8,
-	strength = 6,
-	toughness = 120,
-	color = Color3.fromRGB(155, 78, 62),
-	renderMaterial = Enum.Material.Brick,
-	fractureTable = Chunkr.Fracture.Stock.stone(120),
-})
 Chunkr.Materials.define("LabWood", {
 	density = 0.4,
 	strength = 2,
@@ -56,149 +35,74 @@ Chunkr.Materials.define("LabWood", {
 	color = Color3.fromRGB(133, 94, 66),
 	renderMaterial = Enum.Material.WoodPlanks,
 	breakMode = "detach",
-	flammability = 0.85,
 	fractureTable = Chunkr.Fracture.Stock.wood(50),
 })
 
 local world = Chunkr.new()
 world:Start()
 
-Chunkr.Events.OnVaporIgnite:Connect(function()
-	print("  -> GAS FLASH")
-end)
-Chunkr.Events.OnJointBroken:Connect(function()
-	print("  -> cable link broke")
-end)
+-- One beam, four cables. Each column: x offset + its own slack/thickness.
+local BEAM_Y = 24
+local COLUMNS = {
+	{ x = -18, slack = 0.02, thickness = 0.15, color = Color3.fromRGB(210, 210, 220) },
+	{ x = -6, slack = 0.15, thickness = 0.3, color = Color3.fromRGB(150, 150, 160) },
+	{ x = 6, slack = 0.35, thickness = 0.5, color = Color3.fromRGB(90, 90, 100) },
+	{ x = 18, slack = 0.6, thickness = 0.75, color = Color3.fromRGB(55, 45, 40) },
+}
 
-local ARENA = Vector3.new(0, 0, -20)
+local function run()
+	print("[cables] four cables from one beam: taut/thin -> slack/thick")
+	local beam = world:Build(CFrame.new(0, BEAM_Y, -20), Vector3.new(46, 2, 2), "LabStone")
 
--- ---------------------------------------------------------------- 1 cables
-
-local function cables()
-	print("[1] cables: a crate hangs from a stone beam, then the cable is cut")
-	local beam = world:Build(CFrame.new(ARENA + Vector3.new(0, 22, 0)), Vector3.new(10, 2, 2), "LabStone")
-
-	-- Anchored while we rig it, so it doesn't fall before the cable grabs.
-	local crate = world:NewBody(5, 5, 5, { voxelSize = 1, cframe = CFrame.new(ARENA + Vector3.new(-2.5, 8, -2.5)), anchored = true })
-	crate:StampBox(0, 0, 0, 4, 4, 4, "LabWood")
-	world:Commit(crate)
-	task.wait(1.5) -- both bodies build
-
-	local cable = Chunkr.Cable.create({
-		a = { body = beam, position = ARENA + Vector3.new(0, 21, 0) },
-		b = { body = crate, position = ARENA + Vector3.new(0, 13, 0) },
-		segments = 7,
-		slack = 0.12,
-		thickness = 0.35,
-	})
-	if not cable then
-		print("  -> cable failed to anchor")
-		world:Reset({})
-		return
+	-- Anchored crates, so they don't fall before the cables grab.
+	local crates = {}
+	for i, col in COLUMNS do
+		local crate = world:NewBody(4, 4, 4, { voxelSize = 1, cframe = CFrame.new(col.x - 2, 10, -22), anchored = true })
+		crate:StampBox(0, 0, 0, 3, 3, 3, "LabWood")
+		world:Commit(crate)
+		crates[i] = crate
 	end
-	print(`  -> cable up ({#cable.segments} segments); releasing the crate to hang`)
-	crate:SetAnchored(false) -- now it swings from the cable
-	task.wait(3)
+	task.wait(1.5) -- everything builds
 
-	print("  -> CUT")
-	cable:CutNear(cable.segments[math.ceil(#cable.segments / 2)].Position, 2.5)
+	local cables = {}
+	for i, col in COLUMNS do
+		local cable = Chunkr.Cable.create({
+			a = { body = beam, position = Vector3.new(col.x, BEAM_Y - 1, -20) },
+			b = { body = crates[i], position = Vector3.new(col.x, 14, -20) },
+			slack = col.slack,
+			thickness = col.thickness,
+			color = col.color,
+		})
+		cables[i] = cable
+		if cable then
+			print(`  -> cable {i}: slack {col.slack}, thickness {col.thickness}, {#cable.segments} segments`)
+			crates[i]:SetAnchored(false) -- release it to hang and sag
+		else
+			print(`  -> cable {i} failed to anchor`)
+		end
+	end
+
+	task.wait(5) -- let them settle so the different sags are clear
+
+	print("  -> cutting every cable")
+	for _, cable in cables do
+		if cable then
+			local mid = cable.segments[math.ceil(#cable.segments / 2)]
+			cable:CutNear(mid.Position, 3)
+		end
+	end
 	task.wait(4)
 
-	cable:Destroy()
-	world:Reset({})
-end
-
--- ---------------------------------------------------------------- 2 marks
-
-local function marks()
-	print("[2] marks: paint/scorch/blood stick; blasting the wall erases only the lost half")
-	local center = ARENA + Vector3.new(0, 8, 0)
-	world:Build(CFrame.new(center), Vector3.new(26, 14, 2), "LabBrick")
-	task.wait(1)
-
-	local splats = {
-		{ off = Vector3.new(-8, 3, 0), color = Color3.fromRGB(230, 60, 60), kind = "paint" },
-		{ off = Vector3.new(-3, -2, 0), color = Color3.fromRGB(60, 120, 230), kind = "paint" },
-		{ off = Vector3.new(3, 4, 0), color = Color3.fromRGB(80, 220, 90), kind = "paint" },
-		{ off = Vector3.new(7, 0, 0), color = nil, kind = "scorch" },
-		{ off = Vector3.new(9, -3, 0), color = nil, kind = "blood" },
-	}
-	for _, splat in splats do
-		local target = center + splat.off
-		local stuck = world:Paint(target + Vector3.new(0, 0, 12), Vector3.new(0, 0, -1), 20, { kind = splat.kind, color = splat.color, size = 2 })
-		print(`  -> {splat.kind} {stuck and "stuck" or "missed"}`)
-		task.wait(0.3)
+	for _, cable in cables do
+		if cable then
+			cable:Destroy()
+		end
 	end
-
-	task.wait(2.5)
-	print("  -> blasting the left half; its paint goes with it, the rest stays")
-	world:Explode(center + Vector3.new(-8, 0, -2), 6, 12)
-	task.wait(5)
-	world:Reset({})
-end
-
--- ---------------------------------------------------------------- 3 vapor
-
-local function vapor()
-	print("[3] vapor: filling a room with gas, then sparking it")
-	local room = ARENA + Vector3.new(0, 5, 0)
-	world:Build(CFrame.new(room + Vector3.new(-6, 3, 0)), Vector3.new(2, 8, 10), "LabStone")
-	world:Build(CFrame.new(room + Vector3.new(6, 3, 0)), Vector3.new(2, 8, 10), "LabStone")
-
-	for _ = 1, 8 do
-		world:LeakGas(room + Vector3.new(math.random(-4, 4), math.random(0, 4), math.random(-3, 3)), 2.5)
-		task.wait(0.25)
-	end
-	print("  -> SPARK")
-	world:Spark(room + Vector3.new(0, 2, 0), 6)
-	task.wait(3)
-
-	local plank = Instance.new("Part")
-	plank.Size = Vector3.new(8, 1, 3)
-	plank.Position = room + Vector3.new(0, 1, 14)
-	plank.Material = Enum.Material.WoodPlanks
-	plank.Color = Color3.fromRGB(133, 94, 66)
-	plank.Anchored = true
-	plank.Parent = workspace
-	world:Ignite(plank.Position, 3)
-	task.wait(5)
-	if plank.Parent then
-		plank:Destroy()
-	end
-	world:Reset({})
-end
-
--- ---------------------------------------------------------------- 4 x-ray
-
-local function xray()
-	print("[4] x-ray: a top-heavy column ghosted by stress, then overloaded")
-	local base = ARENA + Vector3.new(0, 0, 0)
-	local column = world:NewBody(3, 20, 3, { voxelSize = 1, cframe = CFrame.new(base) })
-	column:StampBox(0, 0, 0, 2, 19, 2, "LabStone")
-	world:Commit(column)
-	task.wait(1.5)
-
-	world:ShowStress()
-	print("  -> x-ray ON (base hotter than the top)")
-	task.wait(4)
-
-	print("  -> capping it with heavy stone; the base goes red, then fails")
-	world:Build(CFrame.new(base + Vector3.new(1.5, 22, 1.5)), Vector3.new(9, 6, 9), "LabStone")
-	task.wait(6)
-
-	world:HideStress()
 	world:Reset({})
 end
 
 task.wait(2)
-print("[showcase] 1 cables | 2 marks | 3 vapor | 4 x-ray")
 while true do
-	cables()
-	task.wait(3)
-	marks()
-	task.wait(3)
-	vapor()
-	task.wait(3)
-	xray()
+	run()
 	task.wait(3)
 end
