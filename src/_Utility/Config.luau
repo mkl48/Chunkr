@@ -122,6 +122,16 @@ local Config = {
 		maxVoxels = 100000, -- refuse absurd single builds
 	},
 
+	-- Relief: physical surface texture (proud bricks, recessed panels) tiled
+	-- from a body's exposed surface. Decorative, so it's capped hard.
+	relief = {
+		-- Skip bodies bigger than this (relief re-tiles the whole surface on
+		-- every rebuild; keep it to hero structures).
+		maxVoxels = 20000,
+		-- Max tiles per body before the surface is left flat.
+		budget = 4096,
+	},
+
 	-- Persistence: world:Save/Load chunk snapshots through a DataStore.
 	persist = {
 		dataStore = "Chunkr",

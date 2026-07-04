@@ -19,12 +19,15 @@ local Carve = require(script.Parent.Parent._Patterns.Carve)
 local Damage = require(script.Parent.Parent._Patterns.Damage)
 local Events = require(script.Parent.Parent._Utility.Events)
 local Bin = require(script.Parent.Parent._Utility.Bin)
+local Stencils = require(script.Parent.Parent._Utility.Stencils)
 
 local Body = {}
 Body.__index = Body
 
 Body.PART_TAG = "ChunkrPart"
 Body.ID_ATTRIBUTE = "ChunkrBody"
+-- Material id of the box a rendered Part came from (Relief reads it back).
+Body.MATERIAL_ATTRIBUTE = "ChunkrMaterialId"
 
 local nextId = 0
 
@@ -225,6 +228,67 @@ function Body.CutRay(self: Body, origin: Vector3, target: Vector3, thicknessStud
 	return removed
 end
 
+-- Stencil cutout: projects a 2D silhouette through the body and carves every
+-- voxel it covers. The stencil spans `width` x `height` studs across the
+-- cframe's X/Y plane (stencil row 0 at +Y) and cuts `depth` studs along the
+-- cframe's Z axis, centred on the plane - aim at a wall's surface and half
+-- the depth lands in front of it harmlessly. Returns removed voxel count.
+function Body.Cutout(self: Body, cframe: CFrame, stencil: Stencils.Stencil, width: number, height: number, depth: number, power: number?): number
+	if not self.carvable then
+		return 0
+	end
+	local volume = self.volume
+	local vs = self.voxelSize
+	local hw, hh, hd = width / 2, height / 2, depth / 2
+
+	-- AABB of the cutout box in voxel coordinates: transform its 8 corners.
+	local minX, minY, minZ = math.huge, math.huge, math.huge
+	local maxX, maxY, maxZ = -math.huge, -math.huge, -math.huge
+	for cornerX = -1, 1, 2 do
+		for cornerY = -1, 1, 2 do
+			for cornerZ = -1, 1, 2 do
+				local world = cframe:PointToWorldSpace(Vector3.new(cornerX * hw, cornerY * hh, cornerZ * hd))
+				local x, y, z = self:WorldToLocal(world)
+				minX, maxX = math.min(minX, x), math.max(maxX, x)
+				minY, maxY = math.min(minY, y), math.max(maxY, y)
+				minZ, maxZ = math.min(minZ, z), math.max(maxZ, z)
+			end
+		end
+	end
+	local x0 = math.max(math.floor(minX), 0)
+	local y0 = math.max(math.floor(minY), 0)
+	local z0 = math.max(math.floor(minZ), 0)
+	local x1 = math.min(math.ceil(maxX), volume.sx - 1)
+	local y1 = math.min(math.ceil(maxY), volume.sy - 1)
+	local z1 = math.min(math.ceil(maxZ), volume.sz - 1)
+	if x1 < x0 or y1 < y0 or z1 < z0 then
+		return 0
+	end
+
+	-- Voxel centre (pivot space) -> stencil space, composed once.
+	local toStencil = cframe:ToObjectSpace(self:GetPivot())
+	local removed = 0
+	for y = y0, y1 do
+		for z = z0, z1 do
+			for x = x0, x1 do
+				local q = toStencil:PointToWorldSpace(Vector3.new(x + 0.5, y + 0.5, z + 0.5) * vs)
+				if math.abs(q.X) > hw or math.abs(q.Y) > hh or math.abs(q.Z) > hd then
+					continue
+				end
+				local u = (q.X + hw) / width
+				local v = 1 - (q.Y + hh) / height
+				if Stencils.sample(stencil, u, v) and Carve.voxel(volume, x, y, z, power) then
+					removed += 1
+				end
+			end
+		end
+	end
+	if removed > 0 then
+		Events.OnCarve:Fire(self, cframe.Position, math.max(hw, hh), removed)
+	end
+	return removed
+end
+
 -- Swaps in a new volume whose origin sits at voxel offset (ox,oy,oz) of the
 -- old frame - how a split keeps the largest island without moving in space.
 function Body.ReplaceVolume(self: Body, volume: Volume.Volume, ox: number, oy: number, oz: number)
@@ -284,6 +348,7 @@ function Body.ApplyBoxes(self: Body, boxes: { Types.Box })
 			part.CustomPhysicalProperties = PhysicalProperties.new(material.density, 0.5, 0.2)
 		end
 		part:SetAttribute(Body.ID_ATTRIBUTE, self.id)
+		part:SetAttribute(Body.MATERIAL_ATTRIBUTE, box.id)
 		CollectionService:AddTag(part, Body.PART_TAG)
 		parts[i] = part
 	end

@@ -6,6 +6,7 @@
 
 local Network = require(script.Parent.Network)
 local Fx = require(script.Parent.Fx)
+local Vfx = require(script.Parent.Vfx)
 
 local Client = {}
 
@@ -20,6 +21,10 @@ function Client.start()
 end
 
 Client.fx = Fx
+-- Voxel-cube VFX engine: burst/ring/trail/dissolve/rubbleRain built from real
+-- cubes, driven manually (no physics). Fx.start({ voxels = true }) hooks it
+-- into destruction automatically; call it directly for bespoke effects.
+Client.vfx = Vfx
 Client.RequestCarve = Network.requestCarve
 Client.RequestExplode = Network.requestExplode
 Client.RequestCut = Network.requestCut

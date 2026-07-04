@@ -14,6 +14,7 @@ local Bin = require(script.Parent.Parent._Utility.Bin)
 local Raycast = require(script.Parent.Parent._Utility.Raycast)
 local Persist = require(script.Parent.Parent._Utility.Persist)
 local Query = require(script.Parent.Parent._Utility.Query)
+local Stencils = require(script.Parent.Parent._Utility.Stencils)
 local Grid = require(script.Parent.Parent._Utility.Grid)
 local Events = require(script.Parent.Parent._Utility.Events)
 
@@ -242,6 +243,30 @@ function World.Ignite(self: World, position: Vector3, radiusStuds: number): numb
 		Adopt.sweepRadius(self, position, radiusStuds)
 	end
 	return Fire.igniteSphere(self, position, radiusStuds)
+end
+
+-- Stencil cutout across every body in the box: a shaped hole (star, text,
+-- player silhouette - see Chunkr.Stencils) cut `depthStuds` deep along the
+-- cframe's look axis, centred on the plane. `sizeStuds` is the stencil width
+-- as a number (height keeps the stencil's aspect) or an explicit Vector2.
+function World.Cutout(self: World, cframe: CFrame, stencil: Stencils.Stencil, sizeStuds: Vector2 | number, depthStuds: number, power: number?): number
+	local width, height
+	if typeof(sizeStuds) == "Vector2" then
+		width, height = sizeStuds.X, sizeStuds.Y
+	else
+		width = sizeStuds :: number
+		height = width * stencil.h / stencil.w
+	end
+	Adopt.sweepBox(self, cframe, Vector3.new(width, height, depthStuds))
+	local reach = Vector3.new(width, height, depthStuds).Magnitude / 2
+	local removed = 0
+	for _, body in self.bodies do
+		local center, radius = boundingSphere(body)
+		if (center - cframe.Position).Magnitude <= radius + reach then
+			removed += body:Cutout(cframe, stencil, width, height, depthStuds, power)
+		end
+	end
+	return removed
 end
 
 function World.CutRay(self: World, origin: Vector3, target: Vector3, thicknessStuds: number, power: number?): number

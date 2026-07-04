@@ -34,6 +34,9 @@ local Materials = require(script._Patterns.Materials)
 local Fracture = require(script._Patterns.Fracture)
 local Splinter = require(script._Patterns.Splinter)
 local Persist = require(script._Utility.Persist)
+local Stencils = require(script._Utility.Stencils)
+local Relief = require(script._Main.Relief)
+local Vfx = require(script._Main.Vfx)
 local World = require(script._Main.World)
 local Server = require(script._Main.Server)
 local Client = require(script._Main.Client)
@@ -63,6 +66,16 @@ Chunkr.Events = Events
 -- Snapshot <-> DataStore codec (world:Save/Load are the easy path; this is
 -- the raw encode/decode/store surface for custom backends).
 Chunkr.Persist = Persist
+-- 2D silhouettes for world:Cutout - stock shapes (circle/star/heart/cross/
+-- arch/player), text() in a built-in font, and custom() from ASCII rows.
+Chunkr.Stencils = Stencils
+-- Physical surface texture: proud bricks / recessed panels tiled from a body's
+-- exposed surface, regenerated on every rebuild. Chunkr.Relief.apply(body).
+Chunkr.Relief = Relief
+-- Voxel-cube VFX (burst/ring/trail/dissolve/rubbleRain). Best on clients (via
+-- Chunkr.client().vfx, auto-driven by fx.start({ voxels = true })), but the
+-- cubes are plain anchored parts that replicate, so it works server-side too.
+Chunkr.Vfx = Vfx
 
 export type Material = Types.Material
 export type FractureTable = Types.FractureTable
@@ -98,6 +111,7 @@ export type Chunkr = typeof(setmetatable(
 function Chunkr.new(overrides: any?): Chunkr
 	assert(RunService:IsServer(), "Chunkr.new is server-side; use Chunkr.client() on clients")
 	local config = mergedConfig(overrides)
+	Relief.configure(config.relief)
 	return setmetatable({
 		world = World.new(config),
 		config = config,
@@ -157,6 +171,14 @@ end
 
 function Chunkr.CutRay(self: Chunkr, origin: Vector3, target: Vector3, thicknessStuds: number, power: number?): number
 	return self.world:CutRay(origin, target, thicknessStuds, power)
+end
+
+-- Stencil cutout: punches a shaped hole (see Chunkr.Stencils) through every
+-- body in the box, `depthStuds` deep along the cframe's look axis. `size` is
+-- the stencil width in studs (height follows the stencil's aspect) or an
+-- explicit Vector2. Aim at a wall's face and centre the depth on it.
+function Chunkr.Cutout(self: Chunkr, cframe: CFrame, stencil: Stencils.Stencil, size: Vector2 | number, depthStuds: number, power: number?): number
+	return self.world:Cutout(cframe, stencil, size, depthStuds, power)
 end
 
 -- Lights every flammable voxel in the sphere (plain parts in reach are

@@ -78,6 +78,9 @@ local Materials = require(script._Patterns.Materials)
 local Fracture = require(script._Patterns.Fracture)
 local Splinter = require(script._Patterns.Splinter)
 local Persist = require(script._Utility.Persist)
+local Stencils = require(script._Utility.Stencils)
+local Relief = require(script._Main.Relief)
+local Vfx = require(script._Main.Vfx)
 local World = require(script._Main.World)
 local Server = require(script._Main.Server)
 local Client = require(script._Main.Client)
@@ -107,6 +110,16 @@ Chunkr.Events = Events
 -- Snapshot <-> DataStore codec (world:Save/Load are the easy path; this is
 -- the raw encode/decode/store surface for custom backends).
 Chunkr.Persist = Persist
+-- 2D silhouettes for world:Cutout - stock shapes (circle/star/heart/cross/
+-- arch/player), text() in a built-in font, and custom() from ASCII rows.
+Chunkr.Stencils = Stencils
+-- Physical surface texture: proud bricks / recessed panels tiled from a body's
+-- exposed surface, regenerated on every rebuild. Chunkr.Relief.apply(body).
+Chunkr.Relief = Relief
+-- Voxel-cube VFX (burst/ring/trail/dissolve/rubbleRain). Best on clients (via
+-- Chunkr.client().vfx, auto-driven by fx.start({ voxels = true })), but the
+-- cubes are plain anchored parts that replicate, so it works server-side too.
+Chunkr.Vfx = Vfx
 
 export type Material = Types.Material
 export type FractureTable = Types.FractureTable
@@ -142,6 +155,7 @@ export type Chunkr = typeof(setmetatable(
 function Chunkr.new(overrides: any?): Chunkr
 	assert(RunService:IsServer(), "Chunkr.new is server-side; use Chunkr.client() on clients")
 	local config = mergedConfig(overrides)
+	Relief.configure(config.relief)
 	return setmetatable({
 		world = World.new(config),
 		config = config,
@@ -201,6 +215,14 @@ end
 
 function Chunkr.CutRay(self: Chunkr, origin: Vector3, target: Vector3, thicknessStuds: number, power: number?): number
 	return self.world:CutRay(origin, target, thicknessStuds, power)
+end
+
+-- Stencil cutout: punches a shaped hole (see Chunkr.Stencils) through every
+-- body in the box, `depthStuds` deep along the cframe's look axis. `size` is
+-- the stencil width in studs (height follows the stencil's aspect) or an
+-- explicit Vector2. Aim at a wall's face and centre the depth on it.
+function Chunkr.Cutout(self: Chunkr, cframe: CFrame, stencil: Stencils.Stencil, size: Vector2 | number, depthStuds: number, power: number?): number
+	return self.world:Cutout(cframe, stencil, size, depthStuds, power)
 end
 
 -- Lights every flammable voxel in the sphere (plain parts in reach are
@@ -624,12 +646,15 @@ local Carve = require(script.Parent.Parent._Patterns.Carve)
 local Damage = require(script.Parent.Parent._Patterns.Damage)
 local Events = require(script.Parent.Parent._Utility.Events)
 local Bin = require(script.Parent.Parent._Utility.Bin)
+local Stencils = require(script.Parent.Parent._Utility.Stencils)
 
 local Body = {}
 Body.__index = Body
 
 Body.PART_TAG = "ChunkrPart"
 Body.ID_ATTRIBUTE = "ChunkrBody"
+-- Material id of the box a rendered Part came from (Relief reads it back).
+Body.MATERIAL_ATTRIBUTE = "ChunkrMaterialId"
 
 local nextId = 0
 
@@ -830,6 +855,67 @@ function Body.CutRay(self: Body, origin: Vector3, target: Vector3, thicknessStud
 	return removed
 end
 
+-- Stencil cutout: projects a 2D silhouette through the body and carves every
+-- voxel it covers. The stencil spans `width` x `height` studs across the
+-- cframe's X/Y plane (stencil row 0 at +Y) and cuts `depth` studs along the
+-- cframe's Z axis, centred on the plane - aim at a wall's surface and half
+-- the depth lands in front of it harmlessly. Returns removed voxel count.
+function Body.Cutout(self: Body, cframe: CFrame, stencil: Stencils.Stencil, width: number, height: number, depth: number, power: number?): number
+	if not self.carvable then
+		return 0
+	end
+	local volume = self.volume
+	local vs = self.voxelSize
+	local hw, hh, hd = width / 2, height / 2, depth / 2
+
+	-- AABB of the cutout box in voxel coordinates: transform its 8 corners.
+	local minX, minY, minZ = math.huge, math.huge, math.huge
+	local maxX, maxY, maxZ = -math.huge, -math.huge, -math.huge
+	for cornerX = -1, 1, 2 do
+		for cornerY = -1, 1, 2 do
+			for cornerZ = -1, 1, 2 do
+				local world = cframe:PointToWorldSpace(Vector3.new(cornerX * hw, cornerY * hh, cornerZ * hd))
+				local x, y, z = self:WorldToLocal(world)
+				minX, maxX = math.min(minX, x), math.max(maxX, x)
+				minY, maxY = math.min(minY, y), math.max(maxY, y)
+				minZ, maxZ = math.min(minZ, z), math.max(maxZ, z)
+			end
+		end
+	end
+	local x0 = math.max(math.floor(minX), 0)
+	local y0 = math.max(math.floor(minY), 0)
+	local z0 = math.max(math.floor(minZ), 0)
+	local x1 = math.min(math.ceil(maxX), volume.sx - 1)
+	local y1 = math.min(math.ceil(maxY), volume.sy - 1)
+	local z1 = math.min(math.ceil(maxZ), volume.sz - 1)
+	if x1 < x0 or y1 < y0 or z1 < z0 then
+		return 0
+	end
+
+	-- Voxel centre (pivot space) -> stencil space, composed once.
+	local toStencil = cframe:ToObjectSpace(self:GetPivot())
+	local removed = 0
+	for y = y0, y1 do
+		for z = z0, z1 do
+			for x = x0, x1 do
+				local q = toStencil:PointToWorldSpace(Vector3.new(x + 0.5, y + 0.5, z + 0.5) * vs)
+				if math.abs(q.X) > hw or math.abs(q.Y) > hh or math.abs(q.Z) > hd then
+					continue
+				end
+				local u = (q.X + hw) / width
+				local v = 1 - (q.Y + hh) / height
+				if Stencils.sample(stencil, u, v) and Carve.voxel(volume, x, y, z, power) then
+					removed += 1
+				end
+			end
+		end
+	end
+	if removed > 0 then
+		Events.OnCarve:Fire(self, cframe.Position, math.max(hw, hh), removed)
+	end
+	return removed
+end
+
 -- Swaps in a new volume whose origin sits at voxel offset (ox,oy,oz) of the
 -- old frame - how a split keeps the largest island without moving in space.
 function Body.ReplaceVolume(self: Body, volume: Volume.Volume, ox: number, oy: number, oz: number)
@@ -889,6 +975,7 @@ function Body.ApplyBoxes(self: Body, boxes: { Types.Box })
 			part.CustomPhysicalProperties = PhysicalProperties.new(material.density, 0.5, 0.2)
 		end
 		part:SetAttribute(Body.ID_ATTRIBUTE, self.id)
+		part:SetAttribute(Body.MATERIAL_ATTRIBUTE, box.id)
 		CollectionService:AddTag(part, Body.PART_TAG)
 		parts[i] = part
 	end
@@ -1716,6 +1803,7 @@ mod("Client", _3, [[
 
 local Network = require(script.Parent.Network)
 local Fx = require(script.Parent.Fx)
+local Vfx = require(script.Parent.Vfx)
 
 local Client = {}
 
@@ -1730,6 +1818,10 @@ function Client.start()
 end
 
 Client.fx = Fx
+-- Voxel-cube VFX engine: burst/ring/trail/dissolve/rubbleRain built from real
+-- cubes, driven manually (no physics). Fx.start({ voxels = true }) hooks it
+-- into destruction automatically; call it directly for bespoke effects.
+Client.vfx = Vfx
 Client.RequestCarve = Network.requestCarve
 Client.RequestExplode = Network.requestExplode
 Client.RequestCut = Network.requestCut
@@ -1762,6 +1854,7 @@ mod("Fx", _3, [[
 local Debris = game:GetService("Debris")
 
 local Events = require(script.Parent.Parent._Utility.Events)
+local Vfx = require(script.Parent.Vfx)
 
 local Fx = {}
 
@@ -1774,6 +1867,11 @@ type Options = {
 	budget: number?,
 	-- Shake strength multiplier (0 disables like shake = false).
 	shakeScale: number?,
+	-- Add voxel-cube VFX (Vfx: cube bursts + shockwave rings) on top of the
+	-- particle effects for a chunkier, physical look. Off by default.
+	voxels: boolean?,
+	-- Cube budget passed to Vfx.setBudget when voxels are on (default 150).
+	voxelBudget: number?,
 }
 
 local connection: any = nil
@@ -1932,15 +2030,23 @@ local function handle(payload: any)
 	local position: Vector3 = payload.p
 	local particles = options.particles ~= false
 
+	local voxels = options.voxels == true
+
 	if payload.t == "fracture" then
 		local impulse = tonumber(payload.j) or 0
+		local color = materialColor(payload.m)
 		local part = particles and acquire(position) or nil
 		if part then
-			local color = materialColor(payload.m)
 			emit(part, color, math.clamp(6 + impulse // 40, 6, 30), 14, 0.35, 0.7, 60)
 			smoke(part, 4, 0.8)
 			sound(part, "fracture", math.clamp(0.3 + impulse / 800, 0.3, 1))
 			release(part, 2)
+		end
+		if voxels then
+			Vfx.burst({ position = position, color = color, count = math.clamp(6 + impulse // 80, 6, 26), speed = 12 + impulse / 400 })
+			if impulse > 900 then
+				Vfx.ring({ position = position, color = color })
+			end
 		end
 		addTrauma(math.clamp(impulse / 1500, 0.05, 0.5), position)
 	elseif payload.t == "carve" then
@@ -1951,6 +2057,9 @@ local function handle(payload: any)
 			sound(part, "carve", 0.4)
 			release(part, 2)
 		end
+		if voxels then
+			Vfx.burst({ position = position, color = Color3.fromRGB(150, 140, 130), count = math.clamp(3 + removed // 30, 3, 18), speed = 10 })
+		end
 	elseif payload.t == "crumble" then
 		local part = particles and acquire(position) or nil
 		if part then
@@ -1958,12 +2067,18 @@ local function handle(payload: any)
 			sound(part, "crumble", 0.35)
 			release(part, 2.5)
 		end
+		if voxels then
+			Vfx.dissolve({ position = position, region = Vector3.one * 2 })
+		end
 	elseif payload.t == "split" then
 		local part = particles and acquire(position) or nil
 		if part then
 			emit(part, Color3.fromRGB(120, 115, 110), 8, 8, 0.3, 0.5, 80)
 			sound(part, "split", 0.4)
 			release(part, 1.5)
+		end
+		if voxels then
+			Vfx.burst({ position = position, color = Color3.fromRGB(130, 124, 118), count = 6, speed = 9 })
 		end
 	elseif payload.t == "creak" then
 		local severity = tonumber(payload.s) or 0.7
@@ -2023,6 +2138,9 @@ function Fx.start(opts: Options?)
 		return
 	end
 	options = opts or {}
+	if options.voxels then
+		Vfx.setBudget(options.voxelBudget or 150)
+	end
 	connection = Events.OnFx:Connect(handle)
 	startShake()
 end
@@ -2035,6 +2153,9 @@ function Fx.stop()
 	if shakeConnection then
 		shakeConnection:Disconnect()
 		shakeConnection = nil
+	end
+	if options.voxels then
+		Vfx.stop()
 	end
 	trauma = 0
 end
@@ -2168,6 +2289,414 @@ function Network.requestBuild(position: Vector3, size: Vector3, material: string
 end
 
 return Network
+]])
+mod("Relief", _3, [[
+-- Relief: physical surface texture. Real geometry, not a flat image - bricks
+-- stand PROUD of the mortar, panels sink into their frames, so a wall catches
+-- light and casts shadow like it's actually laid course by course.
+--
+--   Chunkr.Relief.apply(body, { profile = "Brick" })
+--   Chunkr.Relief.define("Panel", { brick = Vector2.new(4, 2), depth = -0.12, mortar = 0.15 })
+--
+-- How it works: the body's exposed surface is face-culled from the volume and
+-- greedy-merged into flat rectangles, then each rectangle is tiled with a
+-- running-bond grid of small cuboids offset `depth` studs along the surface
+-- normal (+ proud, - recessed). The tiles are VISUAL ONLY - CanCollide off,
+-- massless, CanQuery off so shots pass through to the real voxels underneath.
+--
+-- Relief re-generates on every OnBodyRebuilt, so it survives carves and splits:
+-- damage a brick wall and the fresh surface re-bricks itself automatically.
+-- Best on hero structures - generation is skipped past config.relief.maxVoxels.
+
+local CollectionService = game:GetService("CollectionService")
+
+local Materials = require(script.Parent.Parent._Patterns.Materials)
+local Events = require(script.Parent.Parent._Utility.Events)
+
+local Relief = {}
+
+Relief.TAG = "ChunkrRelief"
+
+export type Profile = {
+	-- Brick face size on the wall plane: X = width (along the surface,
+	-- horizontal), Y = height (course height), in studs.
+	brick: Vector2,
+	-- Protrusion along the surface normal: + stands proud (brick), - recesses
+	-- (sunken panel). Studs.
+	depth: number,
+	-- Gap left flat between tiles (the mortar line), studs.
+	mortar: number,
+	-- "running" offsets every other course by half a brick; "stack" aligns.
+	bond: ("running" | "stack")?,
+	-- Tile colour override; defaults to the material colour, darkened a touch
+	-- so the proud faces read against the mortar behind them.
+	color: Color3?,
+	-- Per-tile brightness variation, 0..1 (default 0.06).
+	jitter: number?,
+	-- Tile render material; defaults to the source material's renderMaterial.
+	material: Enum.Material?,
+}
+
+type ApplyOptions = {
+	profile: (string | Profile)?,
+	-- Which surfaces to texture. Default the four vertical sides {"+X","-X",
+	-- "+Z","-Z"}; add "+Y"/"-Y" for tops/bottoms.
+	faces: { string }?,
+	-- Max tiles per body (default config.relief.budget). Surface past the cap
+	-- stays flat.
+	budget: number?,
+	-- Only texture voxels of these material names (default: all).
+	materials: { string }?,
+}
+
+type Registration = {
+	profile: Profile,
+	faces: { string },
+	budget: number,
+	materialIds: { [number]: boolean }?,
+}
+
+-- ---------------------------------------------------------------- profiles
+
+local profiles: { [string]: Profile } = {}
+
+function Relief.define(name: string, profile: Profile)
+	profiles[name] = profile
+end
+
+-- Stock: standard running-bond brick, proud of the mortar.
+Relief.define("Brick", {
+	brick = Vector2.new(2.5, 1),
+	depth = 0.12,
+	mortar = 0.16,
+	bond = "running",
+	jitter = 0.08,
+})
+-- Stock: large stacked panels sunk into their seams (industrial cladding).
+Relief.define("Panel", {
+	brick = Vector2.new(4, 3),
+	depth = -0.14,
+	mortar = 0.2,
+	bond = "stack",
+	jitter = 0.04,
+})
+-- Stock: coursed ashlar stone, shallow relief, no running offset.
+Relief.define("Stone", {
+	brick = Vector2.new(3, 1.5),
+	depth = 0.1,
+	mortar = 0.22,
+	bond = "stack",
+	jitter = 0.1,
+})
+
+local function resolveProfile(profile: string | Profile): Profile
+	if type(profile) == "string" then
+		return assert(profiles[profile], `unknown relief profile "{profile}"`)
+	end
+	return profile
+end
+
+-- ---------------------------------------------------------------- surface
+
+-- Per-face-direction plane basis. `axis` is the world axis the normal runs
+-- along; `u`/`v` span the face (v is "up" for the side faces so brick courses
+-- stack vertically). `d*` is the neighbour offset toward the outside.
+local DIRS = {
+	["+X"] = { axis = Vector3.xAxis, u = Vector3.zAxis, v = Vector3.yAxis, dx = 1, dy = 0, dz = 0, which = "X", sign = 1 },
+	["-X"] = { axis = Vector3.xAxis, u = Vector3.zAxis, v = Vector3.yAxis, dx = -1, dy = 0, dz = 0, which = "X", sign = -1 },
+	["+Z"] = { axis = Vector3.zAxis, u = Vector3.xAxis, v = Vector3.yAxis, dx = 0, dy = 0, dz = 1, which = "Z", sign = 1 },
+	["-Z"] = { axis = Vector3.zAxis, u = Vector3.xAxis, v = Vector3.yAxis, dx = 0, dy = 0, dz = -1, which = "Z", sign = -1 },
+	["+Y"] = { axis = Vector3.yAxis, u = Vector3.xAxis, v = Vector3.zAxis, dx = 0, dy = 1, dz = 0, which = "Y", sign = 1 },
+	["-Y"] = { axis = Vector3.yAxis, u = Vector3.xAxis, v = Vector3.zAxis, dx = 0, dy = -1, dz = 0, which = "Y", sign = -1 },
+}
+
+local STRIDE = 100000
+
+-- (x,y,z) -> (sliceCoord along normal, u, v) for a face direction.
+local function project(which: string, x: number, y: number, z: number): (number, number, number)
+	if which == "X" then
+		return x, z, y
+	elseif which == "Z" then
+		return z, x, y
+	end
+	return y, x, z -- Y
+end
+
+-- Collect exposed unit faces of a direction into per-slice 2D grids, then
+-- greedy-merge each grid into same-material rectangles. Returns a list of
+-- { slice, u0, u1, v0, v1, id } in voxel units.
+local function extractRects(volume: any, dir: any, materialIds: { [number]: boolean }?): { any }
+	local which, dx, dy, dz = dir.which, dir.dx, dir.dy, dir.dz
+	local sx, sy, sz = volume.sx, volume.sy, volume.sz
+
+	-- group key (slice) -> { cells = {[u*STRIDE+v] = id}, umin, umax, vmin, vmax }
+	local groups: { [number]: any } = {}
+	for y = 0, sy - 1 do
+		for z = 0, sz - 1 do
+			for x = 0, sx - 1 do
+				local id = volume:Get(x, y, z)
+				if id == 0 or (materialIds and not materialIds[id]) then
+					continue
+				end
+				if volume:GetSafe(x + dx, y + dy, z + dz) ~= 0 then
+					continue -- buried face
+				end
+				local slice, u, v = project(which, x, y, z)
+				local group = groups[slice]
+				if not group then
+					group = { cells = {}, umin = u, umax = u, vmin = v, vmax = v }
+					groups[slice] = group
+				end
+				group.cells[u * STRIDE + v] = id
+				group.umin, group.umax = math.min(group.umin, u), math.max(group.umax, u)
+				group.vmin, group.vmax = math.min(group.vmin, v), math.max(group.vmax, v)
+			end
+		end
+	end
+
+	local rects = {}
+	for slice, group in groups do
+		local cells = group.cells
+		local claimed: { [number]: boolean } = {}
+		for v = group.vmin, group.vmax do
+			for u = group.umin, group.umax do
+				local key = u * STRIDE + v
+				local id = cells[key]
+				if id == nil or claimed[key] then
+					continue
+				end
+				-- Grow along u.
+				local u1 = u
+				while cells[(u1 + 1) * STRIDE + v] == id and not claimed[(u1 + 1) * STRIDE + v] do
+					u1 += 1
+				end
+				-- Grow along v while the whole row matches.
+				local v1 = v
+				local growing = true
+				while growing do
+					local nv = v1 + 1
+					for iu = u, u1 do
+						local k = iu * STRIDE + nv
+						if cells[k] ~= id or claimed[k] then
+							growing = false
+							break
+						end
+					end
+					if growing then
+						v1 = nv
+					end
+				end
+				for iv = v, v1 do
+					for iu = u, u1 do
+						claimed[iu * STRIDE + iv] = true
+					end
+				end
+				table.insert(rects, { slice = slice, u0 = u, u1 = u1, v0 = v, v1 = v1, id = id })
+			end
+		end
+	end
+	return rects
+end
+
+-- ---------------------------------------------------------------- tiling
+
+local rng = Random.new()
+
+local function tileColor(base: Color3, jitter: number): Color3
+	local f = 1 + rng:NextNumber(-jitter, jitter)
+	return Color3.new(math.clamp(base.R * f, 0, 1), math.clamp(base.G * f, 0, 1), math.clamp(base.B * f, 0, 1))
+end
+
+-- Lay a running-bond brick grid over one rectangle, emitting tile parts into
+-- `out`. Returns how many were emitted (respecting the remaining budget).
+local function tileRect(out: { Part }, rect: any, dir: any, profile: Profile, pivot: CFrame, vs: number, remaining: number, anchored: boolean): number
+	local material = Materials.byId(rect.id)
+	if not material then
+		return 0
+	end
+	local baseColor = profile.color or material.color:Lerp(Color3.new(0, 0, 0), 0.12)
+	local renderMaterial = profile.material or material.renderMaterial or Enum.Material.Plastic
+	local jitter = profile.jitter or 0.06
+	local bond = profile.bond or "running"
+
+	-- Rectangle bounds in studs on the (u, v) plane.
+	local uLo, uHi = rect.u0 * vs, (rect.u1 + 1) * vs
+	local vLo, vHi = rect.v0 * vs, (rect.v1 + 1) * vs
+	-- Plane coordinate along the normal (outer face of the voxel slab).
+	local planeValue = if dir.sign > 0 then (rect.slice + 1) * vs else rect.slice * vs
+	local coordAlongAxis = planeValue + dir.sign * profile.depth / 2
+
+	local brickW, brickH = profile.brick.X, profile.brick.Y
+	local courseH = brickH + profile.mortar
+	local cellW = brickW + profile.mortar
+	local mortar = profile.mortar
+	local minTile = math.min(brickW, brickH) * 0.25
+
+	local count = 0
+	local course = 0
+	local v = vLo
+	while v < vHi - 1e-3 and count < remaining do
+		local tileTop = math.min(v + brickH, vHi)
+		local bh = tileTop - v - mortar
+		if bh > minTile then
+			local vc = v + (tileTop - v) / 2
+			local offset = if bond == "running" and course % 2 == 1 then -brickW / 2 else 0
+			-- Start one cell left so the offset row still fills the left edge.
+			local u = uLo + offset - cellW
+			while u < uHi - 1e-3 and count < remaining do
+				local left = math.max(u + mortar / 2, uLo)
+				local right = math.min(u + brickW - mortar / 2, uHi)
+				local bw = right - left
+				if bw > minTile then
+					local uc = (left + right) / 2
+					local localCenter = dir.axis * coordAlongAxis + dir.u * uc + dir.v * vc
+					local part = Instance.new("Part")
+					part.Name = "Relief"
+					part.Size = Vector3.new(bw, bh, math.abs(profile.depth))
+					part.CFrame = pivot * CFrame.fromMatrix(localCenter, dir.u, dir.v)
+					part.Anchored = anchored
+					part.CanCollide = false
+					part.CanQuery = false
+					part.CanTouch = false
+					part.CastShadow = true
+					part.Massless = true
+					part.Color = tileColor(baseColor, jitter)
+					part.Material = renderMaterial
+					part.Transparency = material.transparency
+					part.Reflectance = material.reflectance
+					CollectionService:AddTag(part, Relief.TAG)
+					table.insert(out, part)
+					count += 1
+				end
+				u += cellW
+			end
+		end
+		v += courseH
+		course += 1
+	end
+	return count
+end
+
+-- ---------------------------------------------------------------- generate
+
+local function clearTiles(body: any)
+	for _, child in body.model:GetChildren() do
+		if child:IsA("BasePart") and CollectionService:HasTag(child, Relief.TAG) then
+			child:Destroy()
+		end
+	end
+end
+
+local registry: { [any]: Registration } = {}
+local config: any = { maxVoxels = 20000, budget = 4096 }
+local hooked = false
+
+local function generate(body: any, reg: Registration)
+	if body.destroyed then
+		return
+	end
+	local root = body.rootPart
+	if not root then
+		return
+	end
+	local volume = body.volume
+	if volume.solidCount > config.maxVoxels then
+		return
+	end
+
+	local pivot = body:GetPivot()
+	local vs = body.voxelSize
+	local tiles: { Part } = {}
+	local remaining = reg.budget
+	for _, faceName in reg.faces do
+		local dir = DIRS[faceName]
+		if not dir or remaining <= 0 then
+			continue
+		end
+		for _, rect in extractRects(volume, dir, reg.materialIds) do
+			if remaining <= 0 then
+				break
+			end
+			remaining -= tileRect(tiles, rect, dir, reg.profile, pivot, vs, remaining, body.anchored)
+		end
+	end
+
+	if #tiles > 0 and reg.budget >= config.budget then
+		warn(`[Chunkr] relief on body {body.id} hit the tile budget ({reg.budget}); surface may be partly flat`)
+	end
+	-- Weld to the root so a dynamic body carries its texture; anchored bodies
+	-- hold their tiles in place directly.
+	for _, part in tiles do
+		if not body.anchored then
+			local weld = Instance.new("WeldConstraint")
+			weld.Part0 = root
+			weld.Part1 = part
+			weld.Parent = part
+		end
+		part.Parent = body.model
+	end
+end
+
+local function ensureHook()
+	if hooked then
+		return
+	end
+	hooked = true
+	-- ApplyBoxes ClearAllChildren's first, so at rebuild time the model has
+	-- only fresh Boxer parts - just regenerate on top.
+	Events.OnBodyRebuilt:Connect(function(body)
+		local reg = registry[body]
+		if reg then
+			generate(body, reg)
+		end
+	end)
+	Events.OnBodyRemoved:Connect(function(body)
+		registry[body] = nil
+	end)
+end
+
+-- ---------------------------------------------------------------- API
+
+-- Give `config` a home so Chunkr.new can hand relief its tuning section.
+function Relief.configure(section: any)
+	if section then
+		config = section
+	end
+end
+
+-- Texture a body's surface with proud/recessed relief tiles. Regenerates
+-- automatically on every rebuild (carves, splits) until Relief.remove.
+function Relief.apply(body: any, options: ApplyOptions?)
+	ensureHook()
+	local opts = options or {}
+	local materialIds: { [number]: boolean }? = nil
+	if opts.materials then
+		materialIds = {}
+		for _, name in opts.materials do
+			local material = Materials.find(name)
+			if material then
+				materialIds[material.id] = true
+			end
+		end
+	end
+	local reg: Registration = {
+		profile = resolveProfile(opts.profile or "Brick"),
+		faces = opts.faces or { "+X", "-X", "+Z", "-Z" },
+		budget = opts.budget or config.budget,
+		materialIds = materialIds,
+	}
+	registry[body] = reg
+	clearTiles(body)
+	generate(body, reg)
+end
+
+-- Strip a body's relief and stop regenerating it.
+function Relief.remove(body: any)
+	registry[body] = nil
+	clearTiles(body)
+end
+
+return Relief
 ]])
 mod("Render", _3, [[
 -- Rebox scheduling: bodies flagged `needsRemesh` get Boxer jobs (parallel via
@@ -2643,6 +3172,349 @@ end
 
 return Simulation
 ]])
+mod("Vfx", _3, [[
+-- Chunkr voxel VFX: effects built from tiny CUBE parts instead of particle
+-- sprites, so debris/impacts read as voxels like everything else. Cubes are
+-- pooled, anchored, and integrated by hand on Heartbeat (position + spin +
+-- faked gravity) - zero physics cost, hard budget cap.
+--
+--   local vfx = Chunkr.client().vfx
+--   vfx.burst({ position = p, color = c })            -- impact spray
+--   vfx.ring({ position = p })                        -- expanding shockwave
+--   local trail = vfx.trail(part, { color = c })      -- cube streak; trail.Stop()
+--   vfx.dissolve({ position = p, region = size })     -- surface flakes drift off
+--   vfx.rubbleRain({ position = ceiling })            -- dust-fall before collapse
+--
+-- The stock FX pack drives these automatically from destruction events with
+-- Chunkr.client().fx.start({ voxels = true }). Client only.
+
+local RunService = game:GetService("RunService")
+
+local Vfx = {}
+
+export type BurstOptions = {
+	position: Vector3,
+	color: Color3?,
+	count: number?,
+	speed: number?,
+	size: number?,
+	lifetime: number?,
+	-- Bias cone: cubes fly within `spread` degrees of this direction.
+	direction: Vector3?,
+	spread: number?,
+	-- Gravity multiplier (default 1).
+	gravity: number?,
+}
+
+export type RingOptions = {
+	position: Vector3,
+	color: Color3?,
+	count: number?,
+	speed: number?,
+	size: number?,
+	lifetime: number?,
+	-- Ring plane normal (default up = ground shockwave).
+	normal: Vector3?,
+}
+
+export type TrailOptions = {
+	color: Color3?,
+	size: number?,
+	-- Seconds between cubes (default 0.05).
+	interval: number?,
+	lifetime: number?,
+}
+
+export type DissolveOptions = {
+	position: Vector3,
+	-- Box region the flakes spawn throughout.
+	region: Vector3,
+	color: Color3?,
+	count: number?,
+	size: number?,
+	lifetime: number?,
+}
+
+export type RainOptions = {
+	position: Vector3,
+	-- Horizontal spawn area (default 8 x 8 studs).
+	area: Vector2?,
+	color: Color3?,
+	count: number?,
+	size: number?,
+	lifetime: number?,
+}
+
+export type Trail = {
+	Stop: (self: Trail) -> (),
+}
+
+type Cube = {
+	part: Part,
+	position: Vector3,
+	rotation: CFrame,
+	velocity: Vector3,
+	angular: Vector3,
+	gravity: number,
+	age: number,
+	life: number,
+}
+
+type TrailState = {
+	follow: BasePart,
+	options: TrailOptions,
+	accumulator: number,
+	stopped: boolean,
+}
+
+local DEFAULT_BUDGET = 150
+local GRAY = Color3.fromRGB(150, 143, 136)
+
+local pool: { Part } = {}
+local active: { Cube } = {}
+local trails: { TrailState } = {}
+local connection: RBXScriptConnection? = nil
+local budget = DEFAULT_BUDGET
+local rng = Random.new()
+
+-- ---------------------------------------------------------------- lifecycle
+
+local function acquirePart(): Part
+	local part = table.remove(pool)
+	if part then
+		return part
+	end
+	local fresh = Instance.new("Part")
+	fresh.Name = "ChunkrVfx"
+	fresh.Anchored = true
+	fresh.CanCollide = false
+	fresh.CanQuery = false
+	fresh.CanTouch = false
+	fresh.CastShadow = false
+	fresh:SetAttribute("ChunkrIgnore", true)
+	return fresh
+end
+
+local function releaseCube(index: number)
+	local cube = active[index]
+	active[index] = active[#active]
+	active[#active] = nil
+	local part = cube.part
+	if #pool < 64 then
+		part.Parent = nil
+		part.Transparency = 0
+		table.insert(pool, part)
+	else
+		part:Destroy()
+	end
+end
+
+local function step(dt: number)
+	local gravity = workspace.Gravity
+	for i = #active, 1, -1 do
+		local cube = active[i]
+		cube.age += dt
+		if cube.age >= cube.life or cube.position.Y < workspace.FallenPartsDestroyHeight + 100 then
+			releaseCube(i)
+			continue
+		end
+		cube.velocity -= Vector3.new(0, gravity * cube.gravity * dt, 0)
+		cube.position += cube.velocity * dt
+		local spin = cube.angular * dt
+		cube.rotation = cube.rotation * CFrame.fromEulerAnglesXYZ(spin.X, spin.Y, spin.Z)
+		local part = cube.part
+		part.CFrame = CFrame.new(cube.position) * cube.rotation
+		-- Fade out over the last 40% of life.
+		local fadeFrom = cube.life * 0.6
+		if cube.age > fadeFrom then
+			part.Transparency = (cube.age - fadeFrom) / (cube.life - fadeFrom)
+		end
+	end
+
+	for i = #trails, 1, -1 do
+		local trail = trails[i]
+		local follow = trail.follow
+		if trail.stopped or follow.Parent == nil then
+			trails[i] = trails[#trails]
+			trails[#trails] = nil
+			continue
+		end
+		trail.accumulator += dt
+		local interval = trail.options.interval or 0.05
+		if trail.accumulator >= interval then
+			trail.accumulator = 0
+			Vfx.burst({
+				position = follow.Position,
+				color = trail.options.color,
+				count = 1,
+				speed = 1.5,
+				size = trail.options.size or 0.3,
+				lifetime = trail.options.lifetime or 0.8,
+				gravity = 0.15,
+			})
+		end
+	end
+
+	if #active == 0 and #trails == 0 and connection then
+		connection:Disconnect()
+		connection = nil
+	end
+end
+
+local function ensureRunning()
+	if not connection then
+		connection = RunService.Heartbeat:Connect(step)
+	end
+end
+
+local function spawnCube(position: Vector3, velocity: Vector3, color: Color3, size: number, life: number, gravityScale: number)
+	if #active >= budget then
+		return
+	end
+	local part = acquirePart()
+	part.Size = Vector3.one * size
+	part.Color = color
+	part.Transparency = 0
+	local rotation = CFrame.fromEulerAnglesXYZ(rng:NextNumber(0, math.pi), rng:NextNumber(0, math.pi), rng:NextNumber(0, math.pi))
+	part.CFrame = CFrame.new(position) * rotation
+	part.Parent = workspace
+	table.insert(active, {
+		part = part,
+		position = position,
+		rotation = rotation,
+		velocity = velocity,
+		angular = Vector3.new(rng:NextNumber(-8, 8), rng:NextNumber(-8, 8), rng:NextNumber(-8, 8)),
+		gravity = gravityScale,
+		age = 0,
+		life = life * rng:NextNumber(0.7, 1.15),
+	})
+	ensureRunning()
+end
+
+-- Slight per-cube tint variation so a spray doesn't read as one flat colour.
+local function vary(color: Color3): Color3
+	local f = rng:NextNumber(0.85, 1.1)
+	return Color3.new(math.clamp(color.R * f, 0, 1), math.clamp(color.G * f, 0, 1), math.clamp(color.B * f, 0, 1))
+end
+
+-- ---------------------------------------------------------------- emitters
+
+function Vfx.burst(options: BurstOptions)
+	local count = options.count or 24
+	local speed = options.speed or 18
+	local size = options.size or 0.4
+	local life = options.lifetime or 1.2
+	local color = options.color or GRAY
+	local gravityScale = options.gravity or 1
+	local direction = options.direction
+	local spread = math.rad(options.spread or 60)
+	for _ = 1, count do
+		local dir
+		if direction then
+			-- Random direction within the cone around `direction`.
+			local axis = direction.Unit
+			local ortho = axis:Cross(if math.abs(axis.Y) < 0.9 then Vector3.yAxis else Vector3.xAxis).Unit
+			local tilt = rng:NextNumber(0, spread)
+			local roll = rng:NextNumber(0, math.pi * 2)
+			dir = (CFrame.fromAxisAngle(axis, roll) * CFrame.fromAxisAngle(ortho, tilt)):VectorToWorldSpace(axis)
+		else
+			dir = rng:NextUnitVector()
+		end
+		local cubeSize = size * rng:NextNumber(0.6, 1.4)
+		spawnCube(options.position, dir * speed * rng:NextNumber(0.4, 1), vary(color), cubeSize, life, gravityScale)
+	end
+end
+
+function Vfx.ring(options: RingOptions)
+	local count = options.count or 20
+	local speed = options.speed or 14
+	local size = options.size or 0.35
+	local life = options.lifetime or 0.9
+	local color = options.color or GRAY
+	local normal = (options.normal or Vector3.yAxis).Unit
+	local ortho = normal:Cross(if math.abs(normal.Y) < 0.9 then Vector3.yAxis else Vector3.xAxis).Unit
+	for i = 1, count do
+		local angle = (i / count) * math.pi * 2 + rng:NextNumber(-0.1, 0.1)
+		local dir = (CFrame.fromAxisAngle(normal, angle)):VectorToWorldSpace(ortho)
+		local velocity = dir * speed * rng:NextNumber(0.85, 1.1) + normal * speed * 0.12
+		spawnCube(options.position + dir * 0.5, velocity, vary(color), size * rng:NextNumber(0.7, 1.3), life, 0.35)
+	end
+end
+
+-- Cube streak following a part (flying debris, projectiles). Auto-stops when
+-- the part leaves the world; call `:Stop()` to end it early.
+function Vfx.trail(follow: BasePart, options: TrailOptions?): Trail
+	local state: TrailState = {
+		follow = follow,
+		options = options or {},
+		accumulator = 0,
+		stopped = false,
+	}
+	table.insert(trails, state)
+	ensureRunning()
+	return {
+		Stop = function(_self: Trail)
+			state.stopped = true
+		end,
+	}
+end
+
+-- Flakes drift up and off a region - use where a surface is dissolving
+-- (burning walls, despawning debris).
+function Vfx.dissolve(options: DissolveOptions)
+	local count = options.count or 16
+	local size = options.size or 0.3
+	local life = options.lifetime or 1.6
+	local color = options.color or GRAY
+	local half = options.region / 2
+	for _ = 1, count do
+		local at = options.position + Vector3.new(
+			rng:NextNumber(-half.X, half.X),
+			rng:NextNumber(-half.Y, half.Y),
+			rng:NextNumber(-half.Z, half.Z)
+		)
+		local velocity = Vector3.new(rng:NextNumber(-1.5, 1.5), rng:NextNumber(1.5, 3.5), rng:NextNumber(-1.5, 1.5))
+		spawnCube(at, velocity, vary(color), size * rng:NextNumber(0.6, 1.2), life, -0.02)
+	end
+end
+
+-- Cubes shake loose from a ceiling area and fall - the tension beat before
+-- a collapse (pairs with OnCreak).
+function Vfx.rubbleRain(options: RainOptions)
+	local count = options.count or 12
+	local size = options.size or 0.3
+	local life = options.lifetime or 2
+	local color = options.color or GRAY
+	local area = options.area or Vector2.new(8, 8)
+	for _ = 1, count do
+		local at = options.position + Vector3.new(rng:NextNumber(-area.X / 2, area.X / 2), rng:NextNumber(-0.4, 0), rng:NextNumber(-area.Y / 2, area.Y / 2))
+		local velocity = Vector3.new(rng:NextNumber(-0.5, 0.5), rng:NextNumber(-2, 0), rng:NextNumber(-0.5, 0.5))
+		spawnCube(at, velocity, vary(color), size * rng:NextNumber(0.5, 1.3), life, rng:NextNumber(0.6, 1))
+	end
+end
+
+-- ---------------------------------------------------------------- control
+
+-- Max simultaneous cubes (shared across all emitters). Default 150.
+function Vfx.setBudget(count: number)
+	budget = math.max(count, 0)
+end
+
+-- Kill every live cube and trail immediately.
+function Vfx.stop()
+	for i = #active, 1, -1 do
+		active[i].part:Destroy()
+		active[i] = nil
+	end
+	table.clear(trails)
+	if connection then
+		connection:Disconnect()
+		connection = nil
+	end
+end
+
+return Vfx
+]])
 local _4 = mod("Workers", _3, [[
 -- Parallel Luau job pool. Topology/Boxer/Stress are pure buffer -> data
 -- functions, so they travel to Actor VMs; this module owns dispatch, join and
@@ -2802,6 +3674,7 @@ local Bin = require(script.Parent.Parent._Utility.Bin)
 local Raycast = require(script.Parent.Parent._Utility.Raycast)
 local Persist = require(script.Parent.Parent._Utility.Persist)
 local Query = require(script.Parent.Parent._Utility.Query)
+local Stencils = require(script.Parent.Parent._Utility.Stencils)
 local Grid = require(script.Parent.Parent._Utility.Grid)
 local Events = require(script.Parent.Parent._Utility.Events)
 
@@ -3030,6 +3903,30 @@ function World.Ignite(self: World, position: Vector3, radiusStuds: number): numb
 		Adopt.sweepRadius(self, position, radiusStuds)
 	end
 	return Fire.igniteSphere(self, position, radiusStuds)
+end
+
+-- Stencil cutout across every body in the box: a shaped hole (star, text,
+-- player silhouette - see Chunkr.Stencils) cut `depthStuds` deep along the
+-- cframe's look axis, centred on the plane. `sizeStuds` is the stencil width
+-- as a number (height keeps the stencil's aspect) or an explicit Vector2.
+function World.Cutout(self: World, cframe: CFrame, stencil: Stencils.Stencil, sizeStuds: Vector2 | number, depthStuds: number, power: number?): number
+	local width, height
+	if typeof(sizeStuds) == "Vector2" then
+		width, height = sizeStuds.X, sizeStuds.Y
+	else
+		width = sizeStuds :: number
+		height = width * stencil.h / stencil.w
+	end
+	Adopt.sweepBox(self, cframe, Vector3.new(width, height, depthStuds))
+	local reach = Vector3.new(width, height, depthStuds).Magnitude / 2
+	local removed = 0
+	for _, body in self.bodies do
+		local center, radius = boundingSphere(body)
+		if (center - cframe.Position).Magnitude <= radius + reach then
+			removed += body:Cutout(cframe, stencil, width, height, depthStuds, power)
+		end
+	end
+	return removed
 end
 
 function World.CutRay(self: World, origin: Vector3, target: Vector3, thicknessStuds: number, power: number?): number
@@ -9977,6 +10874,12 @@ local function tryCarve(volume: Volume.Volume, x: number, y: number, z: number, 
 	return true
 end
 
+-- Single-voxel carve honouring material strength - Cutout's inner loop.
+-- Caller guarantees in-bounds coordinates.
+function Carve.voxel(volume: Volume.Volume, x: number, y: number, z: number, power: number?): boolean
+	return tryCarve(volume, x, y, z, power or math.huge)
+end
+
 -- Sphere centred at (cx,cy,cz) local voxel coords (fractional ok), radius in voxels.
 function Carve.sphere(volume: Volume.Volume, cx: number, cy: number, cz: number, radius: number, power: number?): number
 	local p = power or math.huge
@@ -12361,6 +13264,16 @@ local Config = {
 		maxVoxels = 100000, -- refuse absurd single builds
 	},
 
+	-- Relief: physical surface texture (proud bricks, recessed panels) tiled
+	-- from a body's exposed surface. Decorative, so it's capped hard.
+	relief = {
+		-- Skip bodies bigger than this (relief re-tiles the whole surface on
+		-- every rebuild; keep it to hero structures).
+		maxVoxels = 20000,
+		-- Max tiles per body before the surface is left flat.
+		budget = 4096,
+	},
+
 	-- Persistence: world:Save/Load chunk snapshots through a DataStore.
 	persist = {
 		dataStore = "Chunkr",
@@ -13020,6 +13933,226 @@ end
 
 return Shapes
 ]])
+mod("Stencils", _14, [[
+-- Stencils: 2D silhouettes for world:Cutout - the cookie cutters. A stencil
+-- is a small bitmap (row 0 = top); Cutout projects it through voxel bodies
+-- and carves every column the mask covers, Looney-Tunes style.
+--
+--   world:Cutout(cframe, Chunkr.Stencils.star(), 8, 3)        -- star hole
+--   world:Cutout(cframe, Chunkr.Stencils.text("BOOM"), Vector2.new(14, 4), 3)
+--   Chunkr.Stencils.custom({ "..##..", ".####.", "######" })  -- your own
+--
+-- Stock shapes are generated analytically at a fixed resolution; text uses a
+-- 5x7 pixel font (A-Z, 0-9, space, ! ?). Pure Luau - no Roblox datatypes -
+-- so it loads headless and inside Workers.
+
+local Stencils = {}
+
+export type Stencil = {
+	w: number,
+	h: number,
+	-- u8 per cell, row-major, row 0 at the TOP. 0 = keep, 1 = carve.
+	mask: buffer,
+}
+
+local RESOLUTION = 48
+
+-- ---------------------------------------------------------------- construction
+
+-- Build a stencil by sampling `solid(px, py)` at cell centres, where px/py
+-- are centred coordinates in [-1, 1] with +py pointing UP.
+function Stencils.fromFunction(w: number, h: number, solid: (number, number) -> boolean): Stencil
+	local mask = buffer.create(w * h)
+	for y = 0, h - 1 do
+		for x = 0, w - 1 do
+			local px = ((x + 0.5) / w) * 2 - 1
+			local py = 1 - ((y + 0.5) / h) * 2
+			if solid(px, py) then
+				buffer.writeu8(mask, y * w + x, 1)
+			end
+		end
+	end
+	return { w = w, h = h, mask = mask }
+end
+
+-- Rows of text, top first: '#', '1' and 'X' are solid, anything else empty.
+-- Rows may be ragged; width is the longest row.
+function Stencils.custom(rows: { string }): Stencil
+	local h = #rows
+	assert(h > 0, "Stencils.custom: no rows")
+	local w = 0
+	for _, row in rows do
+		w = math.max(w, #row)
+	end
+	local mask = buffer.create(w * h)
+	for y, row in rows do
+		for x = 1, #row do
+			local ch = string.sub(row, x, x)
+			if ch == "#" or ch == "1" or ch == "X" then
+				buffer.writeu8(mask, (y - 1) * w + (x - 1), 1)
+			end
+		end
+	end
+	return { w = w, h = h, mask = mask }
+end
+
+-- Sample at normalized (u, v), u right / v DOWN, both clamped to [0, 1].
+function Stencils.sample(stencil: Stencil, u: number, v: number): boolean
+	local x = math.clamp(math.floor(u * stencil.w), 0, stencil.w - 1)
+	local y = math.clamp(math.floor(v * stencil.h), 0, stencil.h - 1)
+	return buffer.readu8(stencil.mask, y * stencil.w + x) == 1
+end
+
+-- ---------------------------------------------------------------- stock shapes
+
+function Stencils.circle(): Stencil
+	return Stencils.fromFunction(RESOLUTION, RESOLUTION, function(px, py)
+		return px * px + py * py <= 1
+	end)
+end
+
+-- Pointy star, one point straight up. `points` >= 3, default 5.
+function Stencils.star(points: number?, innerRatio: number?): Stencil
+	local n = points or 5
+	local inner = innerRatio or 0.45
+	local step = math.pi * 2 / n
+	return Stencils.fromFunction(RESOLUTION, RESOLUTION, function(px, py)
+		local r = math.sqrt(px * px + py * py)
+		if r < 1e-6 then
+			return true
+		end
+		-- Angle from the up axis, folded into one point's wedge: 0 at a point
+		-- tip, 1 at the valley between points.
+		local a = math.atan2(px, py) / step
+		local fold = math.abs(a - math.round(a)) * 2
+		return r <= 1 + (inner - 1) * fold
+	end)
+end
+
+function Stencils.heart(): Stencil
+	return Stencils.fromFunction(RESOLUTION, RESOLUTION, function(px, py)
+		local x = px * 1.3
+		local y = py * 1.3 + 0.15
+		local q = x * x + y * y - 1
+		return q * q * q - x * x * y * y * y <= 0
+	end)
+end
+
+function Stencils.cross(armRatio: number?): Stencil
+	local arm = armRatio or 0.34
+	return Stencils.fromFunction(RESOLUTION, RESOLUTION, function(px, py)
+		return math.abs(px) <= arm or math.abs(py) <= arm
+	end)
+end
+
+-- Doorway: straight sides, semicircular top.
+function Stencils.arch(): Stencil
+	return Stencils.fromFunction(RESOLUTION, RESOLUTION, function(px, py)
+		if math.abs(px) > 0.75 then
+			return false
+		end
+		if py <= 0.25 then
+			return true
+		end
+		local dy = py - 0.25
+		return px * px + dy * dy <= 0.75 * 0.75
+	end)
+end
+
+-- Humanoid silhouette - the classic character-shaped hole in a wall.
+function Stencils.player(): Stencil
+	return Stencils.custom({
+		"....####....",
+		"...######...",
+		"...######...",
+		"....####....",
+		"..########..",
+		".##########.",
+		"##..####..##",
+		"##..####..##",
+		"##..####..##",
+		"#...####...#",
+		"....####....",
+		"...##..##...",
+		"...##..##...",
+		"...##..##...",
+		"...##..##...",
+		"..##....##..",
+		"..##....##..",
+		".###....###.",
+	})
+end
+
+-- ---------------------------------------------------------------- text
+
+-- 5x7 font, one number per row, bit 4 = leftmost pixel.
+local FONT: { [string]: { number } } = {
+	A = { 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 },
+	B = { 0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E },
+	C = { 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E },
+	D = { 0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E },
+	E = { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F },
+	F = { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10 },
+	G = { 0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E },
+	H = { 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 },
+	I = { 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E },
+	J = { 0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C },
+	K = { 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11 },
+	L = { 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F },
+	M = { 0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11 },
+	N = { 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11 },
+	O = { 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E },
+	P = { 0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10 },
+	Q = { 0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D },
+	R = { 0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11 },
+	S = { 0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E },
+	T = { 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 },
+	U = { 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E },
+	V = { 0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04 },
+	W = { 0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11 },
+	X = { 0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11 },
+	Y = { 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04 },
+	Z = { 0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F },
+	["0"] = { 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E },
+	["1"] = { 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E },
+	["2"] = { 0x0E, 0x11, 0x01, 0x06, 0x08, 0x10, 0x1F },
+	["3"] = { 0x0E, 0x11, 0x01, 0x06, 0x01, 0x11, 0x0E },
+	["4"] = { 0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02 },
+	["5"] = { 0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E },
+	["6"] = { 0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E },
+	["7"] = { 0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 },
+	["8"] = { 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E },
+	["9"] = { 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C },
+	["!"] = { 0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04 },
+	["?"] = { 0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04 },
+	[" "] = { 0, 0, 0, 0, 0, 0, 0 },
+}
+
+-- One line of text as a stencil (5x7 glyphs + 1 column spacing). Unknown
+-- characters render as spaces; case-insensitive.
+function Stencils.text(message: string): Stencil
+	local upper = string.upper(message)
+	local count = #upper
+	assert(count > 0, "Stencils.text: empty string")
+	local w = count * 6 - 1
+	local mask = buffer.create(w * 7)
+	for i = 1, count do
+		local glyph = FONT[string.sub(upper, i, i)] or FONT[" "]
+		local x0 = (i - 1) * 6
+		for row = 1, 7 do
+			local bits = glyph[row]
+			for col = 0, 4 do
+				if bit32.btest(bits, bit32.lshift(1, 4 - col)) then
+					buffer.writeu8(mask, (row - 1) * w + x0 + col, 1)
+				end
+			end
+		end
+	end
+	return { w = w, h = 7, mask = mask }
+end
+
+return Stencils
+]])
 mod("Vox", _14, [[
 --!native
 -- MagicaVoxel .vox importer. Parses the first model (SIZE + XYZI) and the
@@ -13144,5 +14277,5 @@ end
 return Vox
 ]])
 
-print("[Chunkr] installed 72 modules (1 scripts) under ReplicatedStorage.Chunkr")
+print("[Chunkr] installed 75 modules (1 scripts) under ReplicatedStorage.Chunkr")
 return true

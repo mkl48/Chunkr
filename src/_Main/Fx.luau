@@ -22,6 +22,7 @@
 local Debris = game:GetService("Debris")
 
 local Events = require(script.Parent.Parent._Utility.Events)
+local Vfx = require(script.Parent.Vfx)
 
 local Fx = {}
 
@@ -34,6 +35,11 @@ type Options = {
 	budget: number?,
 	-- Shake strength multiplier (0 disables like shake = false).
 	shakeScale: number?,
+	-- Add voxel-cube VFX (Vfx: cube bursts + shockwave rings) on top of the
+	-- particle effects for a chunkier, physical look. Off by default.
+	voxels: boolean?,
+	-- Cube budget passed to Vfx.setBudget when voxels are on (default 150).
+	voxelBudget: number?,
 }
 
 local connection: any = nil
@@ -192,15 +198,23 @@ local function handle(payload: any)
 	local position: Vector3 = payload.p
 	local particles = options.particles ~= false
 
+	local voxels = options.voxels == true
+
 	if payload.t == "fracture" then
 		local impulse = tonumber(payload.j) or 0
+		local color = materialColor(payload.m)
 		local part = particles and acquire(position) or nil
 		if part then
-			local color = materialColor(payload.m)
 			emit(part, color, math.clamp(6 + impulse // 40, 6, 30), 14, 0.35, 0.7, 60)
 			smoke(part, 4, 0.8)
 			sound(part, "fracture", math.clamp(0.3 + impulse / 800, 0.3, 1))
 			release(part, 2)
+		end
+		if voxels then
+			Vfx.burst({ position = position, color = color, count = math.clamp(6 + impulse // 80, 6, 26), speed = 12 + impulse / 400 })
+			if impulse > 900 then
+				Vfx.ring({ position = position, color = color })
+			end
 		end
 		addTrauma(math.clamp(impulse / 1500, 0.05, 0.5), position)
 	elseif payload.t == "carve" then
@@ -211,6 +225,9 @@ local function handle(payload: any)
 			sound(part, "carve", 0.4)
 			release(part, 2)
 		end
+		if voxels then
+			Vfx.burst({ position = position, color = Color3.fromRGB(150, 140, 130), count = math.clamp(3 + removed // 30, 3, 18), speed = 10 })
+		end
 	elseif payload.t == "crumble" then
 		local part = particles and acquire(position) or nil
 		if part then
@@ -218,12 +235,18 @@ local function handle(payload: any)
 			sound(part, "crumble", 0.35)
 			release(part, 2.5)
 		end
+		if voxels then
+			Vfx.dissolve({ position = position, region = Vector3.one * 2 })
+		end
 	elseif payload.t == "split" then
 		local part = particles and acquire(position) or nil
 		if part then
 			emit(part, Color3.fromRGB(120, 115, 110), 8, 8, 0.3, 0.5, 80)
 			sound(part, "split", 0.4)
 			release(part, 1.5)
+		end
+		if voxels then
+			Vfx.burst({ position = position, color = Color3.fromRGB(130, 124, 118), count = 6, speed = 9 })
 		end
 	elseif payload.t == "creak" then
 		local severity = tonumber(payload.s) or 0.7
@@ -283,6 +306,9 @@ function Fx.start(opts: Options?)
 		return
 	end
 	options = opts or {}
+	if options.voxels then
+		Vfx.setBudget(options.voxelBudget or 150)
+	end
 	connection = Events.OnFx:Connect(handle)
 	startShake()
 end
@@ -295,6 +321,9 @@ function Fx.stop()
 	if shakeConnection then
 		shakeConnection:Disconnect()
 		shakeConnection = nil
+	end
+	if options.voxels then
+		Vfx.stop()
 	end
 	trauma = 0
 end

@@ -30,6 +30,12 @@ local function tryCarve(volume: Volume.Volume, x: number, y: number, z: number, 
 	return true
 end
 
+-- Single-voxel carve honouring material strength - Cutout's inner loop.
+-- Caller guarantees in-bounds coordinates.
+function Carve.voxel(volume: Volume.Volume, x: number, y: number, z: number, power: number?): boolean
+	return tryCarve(volume, x, y, z, power or math.huge)
+end
+
 -- Sphere centred at (cx,cy,cz) local voxel coords (fractional ok), radius in voxels.
 function Carve.sphere(volume: Volume.Volume, cx: number, cy: number, cz: number, radius: number, power: number?): number
 	local p = power or math.huge
