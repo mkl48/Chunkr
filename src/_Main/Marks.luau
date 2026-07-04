@@ -237,7 +237,9 @@ function Marks.stamp(body: any, worldPos: Vector3, worldNormal: Vector3, options
 	ensureHook()
 	local opts = options or {}
 	local kind = opts.kind or "paint"
-	local localOutward = body:WorldToLocalDirection(worldNormal)
+	-- WorldToLocalDirection returns three components, not a Vector3.
+	local dx, dy, dz = body:WorldToLocalDirection(worldNormal)
+	local localOutward = Vector3.new(dx, dy, dz)
 	if localOutward.Magnitude < 1e-4 then
 		localOutward = Vector3.yAxis
 	else

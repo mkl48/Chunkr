@@ -2768,7 +2768,9 @@ function Marks.stamp(body: any, worldPos: Vector3, worldNormal: Vector3, options
 	ensureHook()
 	local opts = options or {}
 	local kind = opts.kind or "paint"
-	local localOutward = body:WorldToLocalDirection(worldNormal)
+	-- WorldToLocalDirection returns three components, not a Vector3.
+	local dx, dy, dz = body:WorldToLocalDirection(worldNormal)
+	local localOutward = Vector3.new(dx, dy, dz)
 	if localOutward.Magnitude < 1e-4 then
 		localOutward = Vector3.yAxis
 	else
@@ -3288,7 +3290,7 @@ local function generate(body: any, reg: Registration)
 		end
 	end
 
-	if #tiles > 0 and reg.budget >= config.budget then
+	if remaining <= 0 then
 		warn(`[Chunkr] relief on body {body.id} hit the tile budget ({reg.budget}); surface may be partly flat`)
 	end
 	-- Weld to the root so a dynamic body carries its texture; anchored bodies

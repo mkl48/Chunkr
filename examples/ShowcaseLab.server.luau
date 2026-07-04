@@ -1,40 +1,32 @@
--- Chunkr showcase: a grand tour of the whole presentation + systems layer, one
--- station at a time. Each station runs in the same arena and sweeps itself with
--- world:Reset({}) before the next.
+-- Chunkr showcase: the newest systems - cables, persistent marks, the vapor
+-- sim, and the stress x-ray. Each station runs in a shared arena and sweeps
+-- itself with world:Reset({}) before the next.
 --
---   1  cutouts    stencil-shaped holes punched through a wall (star / "CHUNKR"
---                 text / player silhouette / arch)                  world:Cutout
---   2  relief     proud brick, coursed stone and recessed panel textures, then
---                 one is blasted and re-lays over the crater         Relief.apply
---   3  vfx        the voxel-cube VFX engine: burst, ring, dissolve, rubbleRain
---                 and a cube trail off a flung block                       Vfx.*
---   4  cables     a crate hangs from a stone beam on a physical cable, cut and
---                 dropped                                            Cable.create
---   5  marks      paint / scorch / blood that stick to a wall, then half is
---                 blasted away and only the survivors keep their marks  world:Paint
---   6  vapor      a gas leak fills a room and a spark chain-detonates it; a
---                 burning plank vents rising smoke              world:LeakGas/Spark
---   7  x-ray      a top-heavy column ghosted green->red by stress, then
---                 overloaded until the base fails               Chunkr:ShowStress
+--   1  cables   a crate hangs from a stone beam on a physical cable, then the
+--               cable is cut and the crate drops                   Cable.create
+--   2  marks    paint / scorch / blood splats that STICK to a wall; then half
+--               the wall is blasted and only the surviving voxels keep their
+--               marks                                                world:Paint
+--   3  vapor    a gas leak fills a room and a spark chain-detonates it; a
+--               burning plank vents rising smoke              world:LeakGas/Spark
+--   4  x-ray    a top-heavy column ghosted green->red by stress, then
+--               overloaded until the base fails               Chunkr:ShowStress
 --
--- Marks, vapor, relief and cutouts are all server-authoritative and replicate,
--- so this reads in a plain server playtest. On clients, add cube spray to
--- everything with Chunkr.client().fx.start({ voxels = true }).
+-- Marks and vapor are server-authoritative and replicate, so this reads in a
+-- plain server playtest. On clients, add cube spray to destruction with
+-- Chunkr.client().fx.start({ voxels = true }).
 -- Only one Chunkr example ships Enabled at a time.
 -- Requires ReplicatedStorage.Chunkr (rojo place build or dist/bootstrap.luau).
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local Chunkr = require(ReplicatedStorage:WaitForChild("Chunkr"))
-local Stencils = Chunkr.Stencils
-local Relief = Chunkr.Relief
-local Vfx = Chunkr.Vfx
 
 -- ---------------------------------------------------------------- stage
 
 local floor = Instance.new("Part")
 floor.Name = "LabFloor"
-floor.Size = Vector3.new(260, 1, 260)
+floor.Size = Vector3.new(240, 1, 240)
 floor.Position = Vector3.new(0, -0.5, 0)
 floor.Anchored = true
 floor.Color = Color3.fromRGB(60, 60, 65)
@@ -57,15 +49,6 @@ Chunkr.Materials.define("LabBrick", {
 	renderMaterial = Enum.Material.Brick,
 	fractureTable = Chunkr.Fracture.Stock.stone(120),
 })
-Chunkr.Materials.define("LabPanel", {
-	density = 2.2,
-	strength = 7,
-	toughness = 180,
-	color = Color3.fromRGB(120, 125, 135),
-	renderMaterial = Enum.Material.Metal,
-	reflectance = 0.05,
-	fractureTable = Chunkr.Fracture.Stock.stone(180),
-})
 Chunkr.Materials.define("LabWood", {
 	density = 0.4,
 	strength = 2,
@@ -83,128 +66,53 @@ world:Start()
 Chunkr.Events.OnVaporIgnite:Connect(function()
 	print("  -> GAS FLASH")
 end)
+Chunkr.Events.OnJointBroken:Connect(function()
+	print("  -> cable link broke")
+end)
 
--- The arena is reused; every station leaves it clean.
-local ARENA = Vector3.new(0, 0, 0)
+local ARENA = Vector3.new(0, 0, -20)
 
--- ---------------------------------------------------------------- 1 cutouts
-
-local function cutouts()
-	print("[1] cutouts: star / CHUNKR / player / arch punched through a brick wall")
-	local center = ARENA + Vector3.new(0, 9, -20)
-	local wall = world:Build(CFrame.new(center), Vector3.new(44, 16, 2), "LabBrick")
-	if wall then
-		Relief.apply(wall, { profile = "Brick", faces = { "+Z", "-Z" } })
-	end
-	task.wait(1.5)
-
-	local function punch(offsetX: number, stencil, size: Vector2 | number)
-		local removed = world:Cutout(CFrame.new(center + Vector3.new(offsetX, 0, 0)), stencil, size, 3)
-		print(`  -> cut {removed} voxels`)
-		task.wait(1.2)
-	end
-	punch(-16, Stencils.star(5), 9)
-	punch(-2, Stencils.text("CHUNKR"), Vector2.new(18, 4))
-	punch(11, Stencils.player(), 6)
-	punch(18, Stencils.arch(), Vector2.new(7, 11))
-
-	task.wait(2.5)
-	world:Reset({})
-end
-
--- ---------------------------------------------------------------- 2 relief
-
-local function relief()
-	print("[2] relief: Brick | Stone | Panel textures, then the middle is blasted")
-	local specs = {
-		{ pos = ARENA + Vector3.new(-14, 8, -20), mat = "LabBrick", profile = "Brick" },
-		{ pos = ARENA + Vector3.new(0, 8, -20), mat = "LabStone", profile = "Stone" },
-		{ pos = ARENA + Vector3.new(14, 8, -20), mat = "LabPanel", profile = "Panel" },
-	}
-	for _, spec in specs do
-		local body = world:Build(CFrame.new(spec.pos), Vector3.new(11, 14, 2), spec.mat)
-		if body then
-			Relief.apply(body, { profile = spec.profile, faces = { "+Z", "-Z" } })
-		end
-	end
-	task.wait(3)
-
-	print("  -> blasting the Stone wall; its relief re-lays over the crater")
-	world:Explode(ARENA + Vector3.new(0, 8, -21), 5, 12)
-	task.wait(5)
-	world:Reset({})
-end
-
--- ---------------------------------------------------------------- 3 vfx
-
-local function vfx()
-	print("[3] voxel vfx: burst, ring, dissolve, rubbleRain, cube trail")
-	local hub = ARENA + Vector3.new(0, 6, -18)
-
-	Vfx.burst({ position = hub, color = Color3.fromRGB(200, 140, 70), count = 30, speed = 22 })
-	Vfx.ring({ position = hub - Vector3.new(0, 5, 0), color = Color3.fromRGB(180, 170, 150) })
-	task.wait(1.1)
-	Vfx.burst({ position = hub, color = Color3.fromRGB(150, 150, 160), count = 24, speed = 26, direction = Vector3.xAxis, spread = 25 })
-	task.wait(1.1)
-	Vfx.dissolve({ position = hub, region = Vector3.new(6, 6, 2), color = Color3.fromRGB(120, 110, 100) })
-	task.wait(1.1)
-	Vfx.rubbleRain({ position = hub + Vector3.new(0, 8, 0), area = Vector2.new(10, 6), color = Color3.fromRGB(140, 130, 120) })
-	task.wait(1.2)
-
-	local block = Instance.new("Part")
-	block.Size = Vector3.new(2, 2, 2)
-	block.Position = hub - Vector3.new(10, 0, 0)
-	block.Color = Color3.fromRGB(170, 120, 90)
-	block.Material = Enum.Material.Wood
-	block.Anchored = false
-	block:SetAttribute("ChunkrIgnore", true)
-	block.Parent = workspace
-	block.AssemblyLinearVelocity = Vector3.new(18, 22, 0)
-	local trail = Vfx.trail(block, { color = Color3.fromRGB(170, 120, 90), size = 0.4, interval = 0.04 })
-	task.wait(2)
-	trail:Stop()
-	if block.Parent then
-		block:Destroy()
-	end
-	task.wait(1)
-end
-
--- ---------------------------------------------------------------- 4 cables
+-- ---------------------------------------------------------------- 1 cables
 
 local function cables()
-	print("[4] cables: a crate hangs from a stone beam, then the cable is cut")
-	local at = ARENA + Vector3.new(0, 0, -20)
-	local beam = world:Build(CFrame.new(at + Vector3.new(0, 22, 0)), Vector3.new(10, 2, 2), "LabStone")
-	local crate = world:NewBody(5, 5, 5, { voxelSize = 1, cframe = CFrame.new(at + Vector3.new(-2.5, 8, -2.5)), anchored = false })
+	print("[1] cables: a crate hangs from a stone beam, then the cable is cut")
+	local beam = world:Build(CFrame.new(ARENA + Vector3.new(0, 22, 0)), Vector3.new(10, 2, 2), "LabStone")
+
+	-- Anchored while we rig it, so it doesn't fall before the cable grabs.
+	local crate = world:NewBody(5, 5, 5, { voxelSize = 1, cframe = CFrame.new(ARENA + Vector3.new(-2.5, 8, -2.5)), anchored = true })
 	crate:StampBox(0, 0, 0, 4, 4, 4, "LabWood")
 	world:Commit(crate)
-	task.wait(1.5)
+	task.wait(1.5) -- both bodies build
 
 	local cable = Chunkr.Cable.create({
-		a = { body = beam, position = at + Vector3.new(0, 21, 0) },
-		b = { body = crate, position = at + Vector3.new(0, 13, 0) },
+		a = { body = beam, position = ARENA + Vector3.new(0, 21, 0) },
+		b = { body = crate, position = ARENA + Vector3.new(0, 13, 0) },
 		segments = 7,
 		slack = 0.12,
 		thickness = 0.35,
 	})
-	if cable then
-		print(`  -> cable up ({#cable.segments} segments); crate hangs`)
-		task.wait(3)
-		print("  -> CUT")
-		cable:CutNear(cable.segments[math.ceil(#cable.segments / 2)].Position, 2.5)
-		task.wait(4)
-		cable:Destroy()
-	else
+	if not cable then
 		print("  -> cable failed to anchor")
+		world:Reset({})
+		return
 	end
+	print(`  -> cable up ({#cable.segments} segments); releasing the crate to hang`)
+	crate:SetAnchored(false) -- now it swings from the cable
+	task.wait(3)
+
+	print("  -> CUT")
+	cable:CutNear(cable.segments[math.ceil(#cable.segments / 2)].Position, 2.5)
+	task.wait(4)
+
+	cable:Destroy()
 	world:Reset({})
 end
 
--- ---------------------------------------------------------------- 5 marks
+-- ---------------------------------------------------------------- 2 marks
 
 local function marks()
-	print("[5] marks: paint/scorch/blood stick; blasting the wall erases only the lost half")
-	local center = ARENA + Vector3.new(0, 8, -20)
+	print("[2] marks: paint/scorch/blood stick; blasting the wall erases only the lost half")
+	local center = ARENA + Vector3.new(0, 8, 0)
 	world:Build(CFrame.new(center), Vector3.new(26, 14, 2), "LabBrick")
 	task.wait(1)
 
@@ -217,7 +125,8 @@ local function marks()
 	}
 	for _, splat in splats do
 		local target = center + splat.off
-		world:Paint(target + Vector3.new(0, 0, 12), Vector3.new(0, 0, -1), 20, { kind = splat.kind, color = splat.color, size = 2 })
+		local stuck = world:Paint(target + Vector3.new(0, 0, 12), Vector3.new(0, 0, -1), 20, { kind = splat.kind, color = splat.color, size = 2 })
+		print(`  -> {splat.kind} {stuck and "stuck" or "missed"}`)
 		task.wait(0.3)
 	end
 
@@ -228,11 +137,11 @@ local function marks()
 	world:Reset({})
 end
 
--- ---------------------------------------------------------------- 6 vapor
+-- ---------------------------------------------------------------- 3 vapor
 
 local function vapor()
-	print("[6] vapor: filling a room with gas, then sparking it")
-	local room = ARENA + Vector3.new(0, 5, -20)
+	print("[3] vapor: filling a room with gas, then sparking it")
+	local room = ARENA + Vector3.new(0, 5, 0)
 	world:Build(CFrame.new(room + Vector3.new(-6, 3, 0)), Vector3.new(2, 8, 10), "LabStone")
 	world:Build(CFrame.new(room + Vector3.new(6, 3, 0)), Vector3.new(2, 8, 10), "LabStone")
 
@@ -259,11 +168,11 @@ local function vapor()
 	world:Reset({})
 end
 
--- ---------------------------------------------------------------- 7 x-ray
+-- ---------------------------------------------------------------- 4 x-ray
 
 local function xray()
-	print("[7] x-ray: a top-heavy column ghosted by stress, then overloaded")
-	local base = ARENA + Vector3.new(0, 0, -20)
+	print("[4] x-ray: a top-heavy column ghosted by stress, then overloaded")
+	local base = ARENA + Vector3.new(0, 0, 0)
 	local column = world:NewBody(3, 20, 3, { voxelSize = 1, cframe = CFrame.new(base) })
 	column:StampBox(0, 0, 0, 2, 19, 2, "LabStone")
 	world:Commit(column)
@@ -282,15 +191,8 @@ local function xray()
 end
 
 task.wait(2)
-print("[showcase] 1 cutouts | 2 relief | 3 vfx | 4 cables | 5 marks | 6 vapor | 7 x-ray")
-print("  (clients: Chunkr.client().fx.start({ voxels = true }) for auto cube FX)")
+print("[showcase] 1 cables | 2 marks | 3 vapor | 4 x-ray")
 while true do
-	cutouts()
-	task.wait(3)
-	relief()
-	task.wait(3)
-	vfx()
-	task.wait(3)
 	cables()
 	task.wait(3)
 	marks()

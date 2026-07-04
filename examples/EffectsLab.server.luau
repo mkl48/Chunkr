@@ -77,7 +77,8 @@ local function cables()
 	local at = Vector3.new(-45, 0, -30)
 	local beam = world:Build(CFrame.new(at + Vector3.new(0, 22, 0)), Vector3.new(10, 2, 2), "LabStone")
 
-	local crate = world:NewBody(5, 5, 5, { voxelSize = 1, cframe = CFrame.new(at + Vector3.new(-2.5, 8, -2.5)), anchored = false })
+	-- Anchored while we rig it, so it doesn't fall before the cable grabs.
+	local crate = world:NewBody(5, 5, 5, { voxelSize = 1, cframe = CFrame.new(at + Vector3.new(-2.5, 8, -2.5)), anchored = true })
 	crate:StampBox(0, 0, 0, 4, 4, 4, "LabWood")
 	world:Commit(crate)
 
@@ -92,9 +93,11 @@ local function cables()
 	})
 	if not cable then
 		print("  -> cable failed to anchor")
+		world:Reset({})
 		return
 	end
-	print(`  -> cable up ({#cable.segments} segments); crate hangs`)
+	print(`  -> cable up ({#cable.segments} segments); releasing the crate to hang`)
+	crate:SetAnchored(false) -- now it swings from the cable
 	task.wait(3)
 
 	-- Cut through the middle of the cable; the crate drops.

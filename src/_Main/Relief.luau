@@ -328,7 +328,7 @@ local function generate(body: any, reg: Registration)
 		end
 	end
 
-	if #tiles > 0 and reg.budget >= config.budget then
+	if remaining <= 0 then
 		warn(`[Chunkr] relief on body {body.id} hit the tile budget ({reg.budget}); surface may be partly flat`)
 	end
 	-- Weld to the root so a dynamic body carries its texture; anchored bodies
