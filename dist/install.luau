@@ -1122,15 +1122,19 @@ mod("Cable", _2, [[
 --       b = { body = deck, position = deckAnchor },   -- or { part = p } / { position = p }
 --       segments = 10, thickness = 0.35, slack = 0.15,
 --   })
+--   cable.OnReady:Connect(function() deck:SetAnchored(false) end)  -- hangs it
 --   cable:CutNear(sawTip, 1.5)     -- sever the nearest link
 --   Chunkr.Cable.cutSphere(world, blastPos, radius)   -- cut every cable in range
 --   Chunkr.Cable.autowire(world)   -- carves/explosions auto-sever cables they cross
 --
--- Body endpoints ride the Joint layer: they follow their voxel through
--- rebuilds/splits and BREAK when that voxel is destroyed (blast the anchor
--- point and the cable lets go on its own). Part/world endpoints pin to a fixed
--- host. Segments are ChunkrIgnore, so destruction ops don't voxelize them -
--- cutting goes through CutNear / cutSphere / autowire. Server only.
+-- Lazy attach: you can create a cable in the same breath as the bodies it
+-- links - it holds its segments rigid and grabs each body endpoint the moment
+-- that body finishes building (no waiting for a rebuild first), then fires
+-- OnReady and goes limp so it sags. Body endpoints ride the Joint layer: they
+-- follow their voxel through rebuilds/splits and BREAK when that voxel is
+-- destroyed. Part/world endpoints pin to a fixed host. Segments are
+-- ChunkrIgnore, so destruction ops don't voxelize them - cutting goes through
+-- CutNear / cutSphere / autowire. Server only.
 
 local Signal = require(script.Parent.Parent._Packages.Signal)
 local Joint = require(script.Parent.Joint)
@@ -1171,15 +1175,28 @@ type Link = {
 	cut: boolean,
 }
 
+-- A body endpoint still waiting for its body to build before it can grab.
+type PendingEnd = {
+	endpoint: Endpoint,
+	segment: BasePart,
+}
+
 export type Cable = typeof(setmetatable(
 	{} :: {
 		id: number,
 		model: Model,
 		segments: { BasePart },
 		joints: { any },
+		-- Fires once when both ends are attached and the cable goes limp.
+		OnReady: typeof(Signal.new()),
 		OnCut: typeof(Signal.new()),
+		ready: boolean,
 		destroyed: boolean,
 		_links: { Link },
+		_pending: { PendingEnd },
+		_released: boolean,
+		_retry: RBXScriptConnection?,
+		_deadline: number,
 	},
 	CableProto
 ))
@@ -1195,7 +1212,8 @@ local function makeSegment(model: Model, center: Vector3, dir: Vector3, length: 
 	part.Name = "CableSegment"
 	part.Size = Vector3.new(thickness, thickness, length)
 	part.CFrame = CFrame.lookAt(center, center + dir)
-	part.Anchored = false
+	-- Rigid until the cable is fully attached, then released to hang.
+	part.Anchored = true
 	part.CanCollide = options.collide == true
 	part.CanQuery = false
 	part.Massless = options.massless == true
@@ -1223,36 +1241,9 @@ local function rope(a: Attachment, b: Attachment, length: number): RopeConstrain
 	return constraint
 end
 
--- End link A/B: a Joint when the endpoint is a body (rides its anchor, breaks
--- on voxel death), else a plain rope to a fixed host (part or world pin).
-local function linkEnd(self: Cable, model: Model, endpoint: Endpoint, segment: BasePart): Link?
-	local segAtt = centerAttachment(segment)
-	local gap = (endpoint.position - segment.Position).Magnitude
-	if endpoint.body then
-		local joint = Joint.create({
-			kind = "Rope",
-			bodyA = endpoint.body,
-			positionA = endpoint.position,
-			partB = segment,
-			positionB = segment.Position,
-			props = { Length = math.max(gap, 0.1) },
-		})
-		if not joint then
-			return nil
-		end
-		table.insert(self.joints, joint)
-		return {
-			cut = false,
-			pos = function()
-				return endpoint.position
-			end,
-			sever = function()
-				joint:Break()
-			end,
-		}
-	end
-
-	-- Fixed host: an existing part, or an anchored invisible pin at the point.
+-- A fixed host endpoint (existing part or a world pin): always attaches now,
+-- the host doesn't need to build first.
+local function attachFixed(self: Cable, endpoint: Endpoint, segment: BasePart)
 	local host: BasePart
 	if endpoint.part then
 		host = endpoint.part
@@ -1266,14 +1257,14 @@ local function linkEnd(self: Cable, model: Model, endpoint: Endpoint, segment: B
 		pin.CanQuery = false
 		pin.CFrame = CFrame.new(endpoint.position)
 		pin:SetAttribute("ChunkrIgnore", true)
-		pin.Parent = model
+		pin.Parent = self.model
 		host = pin
 	end
 	local hostAtt = Instance.new("Attachment")
 	hostAtt.WorldPosition = endpoint.position
 	hostAtt.Parent = host
-	local constraint = rope(hostAtt, segAtt, math.max(gap, 0.1))
-	return {
+	local constraint = rope(hostAtt, centerAttachment(segment), math.max((endpoint.position - segment.Position).Magnitude, 0.1))
+	table.insert(self._links, {
 		cut = false,
 		pos = function()
 			return hostAtt.WorldPosition
@@ -1281,7 +1272,35 @@ local function linkEnd(self: Cable, model: Model, endpoint: Endpoint, segment: B
 		sever = function()
 			constraint:Destroy()
 		end,
-	}
+	})
+end
+
+-- Try to grab a body endpoint via a Joint (rides the anchor, breaks on voxel
+-- death). Returns false while the body hasn't built its parts yet.
+local function tryAttachBody(self: Cable, endpoint: Endpoint, segment: BasePart): boolean
+	local gap = math.max((endpoint.position - segment.Position).Magnitude, 0.1)
+	local joint = Joint.create({
+		kind = "Rope",
+		bodyA = endpoint.body,
+		positionA = endpoint.position,
+		partB = segment,
+		positionB = segment.Position,
+		props = { Length = gap },
+	})
+	if not joint then
+		return false
+	end
+	table.insert(self.joints, joint)
+	table.insert(self._links, {
+		cut = false,
+		pos = function()
+			return endpoint.position
+		end,
+		sever = function()
+			joint:Break()
+		end,
+	})
+	return true
 end
 
 function Cable.create(options: CreateOptions): Cable?
@@ -1306,12 +1325,19 @@ function Cable.create(options: CreateOptions): Cable?
 		model = model,
 		segments = {},
 		joints = {},
+		OnReady = Signal.new(),
 		OnCut = Signal.new(),
+		ready = false,
 		destroyed = false,
 		_links = {},
+		_pending = {},
+		_released = false,
+		_retry = nil,
+		_deadline = os.clock() + 8,
 	}, CableProto)
 
-	-- Segments along the straight line; rope slack lets them sag.
+	-- Segments along the straight line (anchored); rope slack lets them sag
+	-- once released.
 	local atts: { Attachment } = {}
 	for i = 1, segCount do
 		local center = posA + dir * ((i - 0.5) * segStep)
@@ -1319,8 +1345,6 @@ function Cable.create(options: CreateOptions): Cable?
 		self.segments[i] = segment
 		atts[i] = centerAttachment(segment)
 	end
-
-	-- Middle links: rope between consecutive segment centres.
 	for i = 1, segCount - 1 do
 		local constraint = rope(atts[i], atts[i + 1], segStep * (1 + slack))
 		local a, b = self.segments[i], self.segments[i + 1]
@@ -1335,18 +1359,62 @@ function Cable.create(options: CreateOptions): Cable?
 		})
 	end
 
-	-- End links (bookend the middle links so nearest-search covers the ends).
-	local endA = linkEnd(self, model, options.a, self.segments[1])
-	local endB = linkEnd(self, model, options.b, self.segments[segCount])
-	if not (endA and endB) then
-		self:Destroy()
-		return nil
+	-- End links: fixed hosts attach now; body hosts attach as soon as the body
+	-- builds (queued in _pending, retried on rebuilds).
+	local function addEnd(endpoint: Endpoint, segment: BasePart)
+		if endpoint.body then
+			if not tryAttachBody(self, endpoint, segment) then
+				table.insert(self._pending, { endpoint = endpoint, segment = segment })
+			end
+		else
+			attachFixed(self, endpoint, segment)
+		end
 	end
-	table.insert(self._links, 1, endA)
-	table.insert(self._links, endB)
+	addEnd(options.a, self.segments[1])
+	addEnd(options.b, self.segments[segCount])
+
+	if #self._pending == 0 then
+		-- Defer so a caller connecting OnReady right after create() still hears it.
+		task.defer(function()
+			self:_release()
+		end)
+	else
+		self._retry = Events.OnBodyRebuilt:Connect(function()
+			for i = #self._pending, 1, -1 do
+				local p = self._pending[i]
+				if tryAttachBody(self, p.endpoint, p.segment) then
+					table.remove(self._pending, i)
+				end
+			end
+			-- Ready when everything's attached, or give up on stragglers so at
+			-- least the attached end holds.
+			if #self._pending == 0 or os.clock() > self._deadline then
+				self:_release()
+			end
+		end)
+	end
 
 	table.insert(active, self)
 	return self
+end
+
+-- ---------------------------------------------------------------- lifecycle
+
+function CableProto._release(self: Cable)
+	if self._released or self.destroyed then
+		return
+	end
+	self._released = true
+	self.ready = true
+	if self._retry then
+		self._retry:Disconnect()
+		self._retry = nil
+	end
+	-- Let the chain go limp and sag.
+	for _, segment in self.segments do
+		segment.Anchored = false
+	end
+	self.OnReady:Fire(self)
 end
 
 -- ---------------------------------------------------------------- cut
@@ -1383,10 +1451,15 @@ function CableProto.Destroy(self: Cable)
 		return
 	end
 	self.destroyed = true
+	if self._retry then
+		self._retry:Disconnect()
+		self._retry = nil
+	end
 	for _, joint in self.joints do
 		joint:Destroy()
 	end
 	self.model:Destroy()
+	self.OnReady:DisconnectAll()
 	self.OnCut:DisconnectAll()
 	local index = table.find(active, self)
 	if index then
